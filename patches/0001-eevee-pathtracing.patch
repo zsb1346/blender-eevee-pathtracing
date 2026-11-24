@@ -1,0 +1,3229 @@
+diff --git a/intern/ghost/intern/GHOST_ContextVK.cc b/intern/ghost/intern/GHOST_ContextVK.cc
+index d21b5209d5a36aaadc76e6f816dd00ab79854d6f..5744a65c30e344347e65f0312239264747a4cd48 100644
+--- a/intern/ghost/intern/GHOST_ContextVK.cc
++++ b/intern/ghost/intern/GHOST_ContextVK.cc
+@@ -228,6 +228,10 @@ class GHOST_DeviceVK {
+       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+   VkPhysicalDeviceAccelerationStructureFeaturesKHR features_acceleration_structure = {
+       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
++  VkPhysicalDeviceDescriptorIndexingFeatures features_descriptor_indexing = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
++  VkPhysicalDeviceSynchronization2Features features_synchronization2 = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+ 
+   int users = 0;
+ 
+@@ -252,6 +256,8 @@ class GHOST_DeviceVK {
+     features_timeline_semaphore.pNext = &features_buffer_device_address;
+     features_buffer_device_address.pNext = &features_robustness2;
+     features_robustness2.pNext = &features_acceleration_structure;
++    features_acceleration_structure.pNext = &features_descriptor_indexing;
++    features_descriptor_indexing.pNext = &features_synchronization2;
+ 
+     volk::vkGetPhysicalDeviceFeatures2(vk_physical_device, &features);
+     init_extensions();
+@@ -643,6 +649,10 @@ struct GHOST_InstanceVK {
+     device_features.drawIndirectFirstInstance = VK_TRUE;
+     device_features.samplerAnisotropy = device.features.features.samplerAnisotropy;
+     device_features.wideLines = device.features.features.wideLines;
++    device_features.shaderStorageImageExtendedFormats =
++        device.features.features.shaderStorageImageExtendedFormats;
++    device_features.shaderStorageImageWriteWithoutFormat =
++        device.features.features.shaderStorageImageWriteWithoutFormat;
+ 
+     VkDeviceCreateInfo device_create_info = {};
+     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+@@ -691,6 +701,24 @@ struct GHOST_InstanceVK {
+     dynamic_rendering.dynamicRendering = VK_TRUE;
+     feature_struct_ptr.push_back(&dynamic_rendering);
+ 
++    /* Enable descriptor indexing for partially bound descriptor ranges. */
++    VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing = {};
++    descriptor_indexing.sType =
++        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
++    descriptor_indexing.descriptorBindingPartiallyBound =
++        device.features_descriptor_indexing.descriptorBindingPartiallyBound;
++    descriptor_indexing.runtimeDescriptorArray =
++        device.features_descriptor_indexing.runtimeDescriptorArray;
++    if (device.extensions.is_enabled(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
++      feature_struct_ptr.push_back(&descriptor_indexing);
++    }
++
++    /* Enable synchronization2 for NRI/NRD. */
++    VkPhysicalDeviceSynchronization2Features synchronization2 = {};
++    synchronization2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
++    synchronization2.synchronization2 = device.features_synchronization2.synchronization2;
++    feature_struct_ptr.push_back(&synchronization2);
++
+     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT
+         dynamic_rendering_unused_attachments = {};
+     dynamic_rendering_unused_attachments.sType =
+diff --git a/scripts/startup/bl_ui/properties_render.py b/scripts/startup/bl_ui/properties_render.py
+index 3e252e97d475954e33364e43bd6b5c16fb814f9c..083d2b2f7535374083ccdadbd9beca0501f4e90e 100644
+--- a/scripts/startup/bl_ui/properties_render.py
++++ b/scripts/startup/bl_ui/properties_render.py
+@@ -425,9 +425,24 @@ class RENDER_PT_eevee_raytracing(RenderButtonsPanel, Panel):
+         col = layout.column()
+         col.prop(props, "ray_tracing_method", text="Method")
+ 
+-        options = context.scene.eevee.ray_tracing_options
+-
+-        col.prop(options, "resolution_scale")
++        if props.ray_tracing_method == 'PATH_TRACING':
++            col = layout.column(align=True)
++            col.prop(props, "pathtracing_max_bounces", text="Max Bounces")
++            col.prop(props, "clamp_surface_direct", text="Clamp Direct")
++            col.prop(props, "clamp_surface_indirect", text="Clamp Indirect")
++
++            col = layout.column(heading="Channels")
++            col.prop(props, "pathtracing_use_direct")
++            col.prop(props, "pathtracing_use_diffuse")
++            col.prop(props, "pathtracing_use_specular")
++            col.prop(props, "pathtracing_use_denoise")
++
++            col = layout.column()
++            col.prop(props, "pathtracing_debug_view")
++        else:
++            options = context.scene.eevee.ray_tracing_options
++            col.prop(options, "resolution_scale")
++            col.prop(props, "clamp_surface_indirect", text="Clamp Indirect")
+ 
+ 
+ class RENDER_PT_eevee_screen_trace(RenderButtonsPanel, Panel):
+diff --git a/source/blender/blenloader/intern/versioning_503.cc b/source/blender/blenloader/intern/versioning_503.cc
+index 9ae7c155a81d54131690c83a5d86419cfcc023bc..1b733090265918b96e3565665111b47ccc5faab0 100644
+--- a/source/blender/blenloader/intern/versioning_503.cc
++++ b/source/blender/blenloader/intern/versioning_503.cc
+@@ -730,6 +730,19 @@ void blo_do_versions_503(FileData * /*fd*/, Library * /*lib*/, Main *bmain)
+     }
+   }
+ 
++  /* Newly added DNA fields read as zero in files saved before the field existed. Zero is also
++   * outside the RNA range and would leave the path tracer with no indirect bounce, making world
++   * lighting and shadowed areas appear completely black. */
++  for (Scene &scene : bmain->scenes) {
++    if (scene.eevee.pathtracing_max_bounces <= 0) {
++      scene.eevee.pathtracing_max_bounces = 8;
++    }
++    if (!scene.eevee.pathtracing_channels_initialized) {
++      scene.eevee.pathtracing_channels = 15;
++      scene.eevee.pathtracing_channels_initialized = true;
++    }
++  }
++
+   /**
+    * Always bump subversion in BKE_blender_version.h when adding versioning
+    * code here, and wrap it inside a MAIN_VERSION_FILE_ATLEAST check.
+diff --git a/source/blender/draw/CMakeLists.txt b/source/blender/draw/CMakeLists.txt
+index 0ade97af4b5f34fd48c5be67e48efc9d834c9336..24c898b6660e2553f3f2b90f680515edceb1fbd2 100644
+--- a/source/blender/draw/CMakeLists.txt
++++ b/source/blender/draw/CMakeLists.txt
+@@ -22,6 +22,10 @@ set(INC
+ set(INC_SYS
+ )
+ 
++if(WITH_VULKAN_BACKEND)
++  add_definitions(-DWITH_VULKAN_BACKEND)
++endif()
++
+ set(SRC
+   intern/attribute_convert.cc
+   intern/draw_cache.cc
+@@ -113,6 +117,7 @@ set(SRC
+   engines/eevee/eevee_lut.cc
+   engines/eevee/eevee_material.cc
+   engines/eevee/eevee_motion_blur.cc
++  engines/eevee/eevee_pathtracing.cc
+   engines/eevee/eevee_pipeline.cc
+   engines/eevee/eevee_precompute.cc
+   engines/eevee/eevee_raytrace.cc
+@@ -213,6 +218,7 @@ set(SRC
+   engines/eevee/eevee_material.hh
+   engines/eevee/eevee_material_shared.hh
+   engines/eevee/eevee_motion_blur.hh
++  engines/eevee/eevee_pathtracing.hh
+   engines/eevee/eevee_pipeline.hh
+   engines/eevee/eevee_precompute.hh
+   engines/eevee/eevee_raytrace.hh
+@@ -459,6 +465,9 @@ set(SHADER_SRC_EEVEE
+   engines/eevee/shaders/eevee_occupancy_convert.bsl.hh
+   engines/eevee/shaders/eevee_occupancy_lib.bsl.hh
+   engines/eevee/shaders/eevee_octahedron_lib.bsl.hh
++  engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh
++  engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
++  engines/eevee/shaders/eevee_pathtracing_taa.bsl.hh
+   engines/eevee/shaders/eevee_pipeline.bsl.hh
+   engines/eevee/shaders/eevee_ray_denoise.bsl.hh
+   engines/eevee/shaders/eevee_ray_generate.bsl.hh
+@@ -522,6 +531,7 @@ set(SHADER_SRC_EEVEE
+   engines/eevee/eevee_lightprobe_shared.hh
+   # engines/eevee/eevee_material_shared.hh  # Excluded (shared).
+   engines/eevee/eevee_motion_blur_shared.hh
++  engines/eevee/eevee_pathtracing_shared.hh
+   engines/eevee/eevee_precompute_shared.hh
+   engines/eevee/eevee_raytrace_shared.hh
+   engines/eevee/eevee_renderbuffers_shared.hh
+diff --git a/source/blender/draw/engines/eevee/eevee_debug_shared.hh b/source/blender/draw/engines/eevee/eevee_debug_shared.hh
+index 787af6506508d7efd806c0aa5b62fbf2c01c9391..174bded04e9d049545ba1fe25b3b13fe7d688cc2 100644
+--- a/source/blender/draw/engines/eevee/eevee_debug_shared.hh
++++ b/source/blender/draw/engines/eevee/eevee_debug_shared.hh
+@@ -71,6 +71,10 @@ enum [[host_shared]] eDebugMode : uint32_t {
+    * Color different buffers of the depth of field.
+    */
+   DEBUG_DOF_PLANES = 16u,
++  /**
++   * Trace one hardware camera ray per pixel and visualize the hit IDs.
++   */
++  DEBUG_PATH_TRACING = 18u,
+ };
+ 
+ #ifndef GPU_SHADER
+diff --git a/source/blender/draw/engines/eevee/eevee_engine.cc b/source/blender/draw/engines/eevee/eevee_engine.cc
+index 578b04b0798a9beb86457a8af2302f0aee65ae4e..e85be0bbffe3ac67dca5780e840ae8dba02b9bc8 100644
+--- a/source/blender/draw/engines/eevee/eevee_engine.cc
++++ b/source/blender/draw/engines/eevee/eevee_engine.cc
+@@ -84,7 +84,7 @@ RenderEngineType DRW_engine_viewport_eevee_type = {
+     /*next*/ nullptr,
+     /*prev*/ nullptr,
+     /*idname*/ "BLENDER_EEVEE",
+-    /*name*/ N_("EEVEE"),
++    /*name*/ N_("EEVEE Path Tracing"),
+     /*flag*/ RE_INTERNAL | RE_USE_PREVIEW | RE_USE_STEREO_VIEWPORT | RE_USE_GPU_CONTEXT,
+     /*update*/ nullptr,
+     /*render*/ &eevee_render,
+diff --git a/source/blender/draw/engines/eevee/eevee_instance.cc b/source/blender/draw/engines/eevee/eevee_instance.cc
+index bb009b7e8703c43d281871aaa38b8da5a861fe31..e638b3838cad3dea4e8270b5f52cba49fd908674 100644
+--- a/source/blender/draw/engines/eevee/eevee_instance.cc
++++ b/source/blender/draw/engines/eevee/eevee_instance.cc
+@@ -386,6 +386,7 @@ void Instance::begin_sync()
+ 
+   depth_of_field.sync();
+   raytracing.sync();
++  path_tracing.begin_sync();
+   motion_blur.sync();
+   hiz_buffer.sync();
+   main_view.sync();
+@@ -464,6 +465,8 @@ void Instance::object_sync(ObjectRef &ob_ref, Manager & /*manager*/)
+       default:
+         break;
+     }
++
++    path_tracing.object_sync(ob_ref);
+   }
+ }
+ 
+@@ -502,6 +505,7 @@ void Instance::end_sync()
+   film.end_sync();
+   cryptomatte.end_sync();
+   pipelines.end_sync();
++  path_tracing.end_sync();
+   light_probes.end_sync();
+   sphere_probes.end_sync();
+   planar_probes.end_sync();
+diff --git a/source/blender/draw/engines/eevee/eevee_instance.hh b/source/blender/draw/engines/eevee/eevee_instance.hh
+index a1d6493d2f3754800c312cc05925f6bdad981d12..7a73ba82688221ba1f47008790a57137108520c9 100644
+--- a/source/blender/draw/engines/eevee/eevee_instance.hh
++++ b/source/blender/draw/engines/eevee/eevee_instance.hh
+@@ -44,6 +44,7 @@
+ #include "eevee_lookdev.hh"
+ #include "eevee_material.hh"
+ #include "eevee_motion_blur.hh"
++#include "eevee_pathtracing.hh"
+ #include "eevee_pipeline.hh"
+ #include "eevee_raytrace.hh"
+ #include "eevee_renderbuffers.hh"
+@@ -119,6 +120,7 @@ class Instance : public DrawEngine {
+   LightModule lights;
+   AmbientOcclusion ambient_occlusion;
+   RayTraceModule raytracing;
++  PathTracingModule path_tracing;
+   VelocityModule velocity;
+   MotionBlurModule motion_blur;
+   DepthOfField depth_of_field;
+@@ -207,6 +209,7 @@ class Instance : public DrawEngine {
+         lights(*this),
+         ambient_occlusion(*this, uniform_data.data.ao),
+         raytracing(*this, uniform_data.raytrace),
++        path_tracing(*this),
+         velocity(*this),
+         motion_blur(*this),
+         depth_of_field(*this),
+@@ -230,7 +233,7 @@ class Instance : public DrawEngine {
+ 
+   StringRefNull name_get() final
+   {
+-    return "EEVEE";
++    return path_tracing.enabled() ? "EEVEE Path Tracing" : "EEVEE";
+   }
+ 
+   bool uses_render_border() const final
+diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing.cc b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5c0a07d2a5f9d14f59b388664879b1461c31105
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
+@@ -0,0 +1,622 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ */
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++
++#include "BKE_attribute.hh"
++#include "BKE_material.hh"
++#include "BKE_mesh.hh"
++#include "BKE_node.hh"
++#include "BKE_node_legacy_types.hh"
++#include "BKE_object.hh"
++
++#include "BLI_math_matrix.hh"
++#include "BLI_math_vector.hh"
++
++#include "DNA_light_types.h"
++#include "DNA_node_types.h"
++#include "DNA_scene_types.h"
++#include "DNA_world_types.h"
++
++#include "GPU_capabilities.hh"
++#include "GPU_context.hh"
++#include "GPU_nrd.hh"
++#include "GPU_state.hh"
++#include "GPU_texture.hh"
++
++#include "draw_cache.hh"
++#include "draw_manager.hh"
++
++#include "eevee_instance.hh"
++#include "eevee_pathtracing.hh"
++
++namespace blender::eevee {
++
++namespace {
++
++const bNode *surface_shader_node(const bNodeTree &ntree, const int output_type)
++{
++  for (const bNode &node : ntree.nodes) {
++    if (node.type_legacy != output_type) {
++      continue;
++    }
++    const bNodeSocket *surface = bke::node_find_socket(node, SOCK_IN, UString("Surface"));
++    if (surface != nullptr && surface->link != nullptr) {
++      return surface->link->fromnode;
++    }
++  }
++  return nullptr;
++}
++
++float socket_float(const bNode &node, const char *name, const float fallback)
++{
++  const bNodeSocket *socket = bke::node_find_socket(node, SOCK_IN, UString(name));
++  if (socket == nullptr || socket->link != nullptr || socket->default_value == nullptr) {
++    return fallback;
++  }
++  if (socket->type != SOCK_FLOAT) {
++    return fallback;
++  }
++  return static_cast<const bNodeSocketValueFloat *>(socket->default_value)->value;
++}
++
++float4 socket_color(const bNode &node, const char *name, const float4 fallback)
++{
++  const bNodeSocket *socket = bke::node_find_socket(node, SOCK_IN, UString(name));
++  if (socket == nullptr || socket->link != nullptr || socket->default_value == nullptr) {
++    return fallback;
++  }
++  if (socket->type != SOCK_RGBA) {
++    return fallback;
++  }
++  const bNodeSocketValueRGBA *value = static_cast<const bNodeSocketValueRGBA *>(
++      socket->default_value);
++  return float4(value->value[0], value->value[1], value->value[2], value->value[3]);
++}
++
++const bNode *principled_node(const blender::Material &material)
++{
++  if (material.nodetree == nullptr) {
++    return nullptr;
++  }
++  const bNode *node = surface_shader_node(*material.nodetree, SH_NODE_OUTPUT_MATERIAL);
++  return (node != nullptr && node->type_legacy == SH_NODE_BSDF_PRINCIPLED) ? node : nullptr;
++}
++
++float3 world_background(const Scene &scene)
++{
++  const blender::World *world = scene.world;
++  if (world == nullptr || world->nodetree == nullptr) {
++    return float3(0.05f);
++  }
++  const bNode *node = surface_shader_node(*world->nodetree, SH_NODE_OUTPUT_WORLD);
++  if (node == nullptr || node->type_legacy != SH_NODE_BACKGROUND) {
++    return float3(0.05f);
++  }
++  const float4 color = socket_color(*node, "Color", float4(0.05f, 0.05f, 0.05f, 1.0f));
++  const float strength = socket_float(*node, "Strength", 1.0f);
++  return float3(color.x, color.y, color.z) * strength;
++}
++
++}  // namespace
++
++void PathTracingModule::begin_sync()
++{
++  const bool raytracing_enabled = (inst_.scene->eevee.flag & SCE_EEVEE_SSR_ENABLED) != 0;
++  const bool pathtracing_selected = inst_.scene->eevee.ray_tracing_method ==
++                                    RAYTRACE_EEVEE_METHOD_PATH_TRACING;
++  const bool ray_query_supported = GPU_ray_query_support();
++  if (raytracing_enabled && pathtracing_selected && !ray_query_supported) {
++    static bool warned_unsupported = false;
++    if (!warned_unsupported) {
++      warned_unsupported = true;
++      printf("EEVEE Path Tracing: GPU ray query is unsupported on this backend. "
++             "Start Blender with --gpu-backend vulkan. Falling back to regular EEVEE.\n");
++    }
++  }
++  /* The evaluated mesh of the object being edited has no stable runtime triangle data, and
++   * building a path tracing BLAS from it triggers an invalid span access. Let regular EEVEE
++   * draw the edited mesh instead. */
++  const bool object_is_edited = inst_.is_viewport() && inst_.draw_ctx &&
++                                inst_.draw_ctx->object_edit != nullptr;
++  enabled_ = ray_query_supported && raytracing_enabled && pathtracing_selected &&
++             !object_is_edited;
++  if (!enabled_) {
++    return;
++  }
++
++  /* Zero is the value of newly added DNA fields in files saved before the field existed.
++   * It is also outside the RNA range, so treat it as the default instead of disabling
++   * all indirect bounces (which makes world lighting and shadowed areas completely black). */
++  const int scene_bounces = inst_.scene->eevee.pathtracing_max_bounces;
++  data_buf_.max_bounces = uint(std::clamp(scene_bounces > 0 ? scene_bounces : 8, 1, 64));
++  data_buf_.clamp_direct = max_ff(inst_.scene->eevee.clamp_surface_direct, 0.0f);
++  data_buf_.clamp_indirect = max_ff(inst_.scene->eevee.clamp_surface_indirect, 0.0f);
++  instances_.clear();
++  primitives_.clear();
++  materials_.clear();
++  lights_.clear();
++
++  MaterialRecord default_material = {};
++  default_material.base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
++  default_material.params = float4(0.5f, 0.0f, 0.0f, 0.0f);
++  materials_.append(default_material);
++
++  tlas_ = gpu::TopLevelASPtr(GPU_ray_tracing_tlas_alloc("EEVEEPathTracingTLAS"));
++}
++
++void PathTracingModule::light_sync(draw::ObjectRef &ob_ref)
++{
++  const blender::Light *light = reinterpret_cast<const blender::Light *>(ob_ref.object->data);
++  if (light == nullptr) {
++    return;
++  }
++
++  const float4x4 object_to_world = ob_ref.object_to_world(0);
++  const float3 position = object_to_world.location();
++  const float3 forward = math::normalize(
++      math::transform_direction(object_to_world, float3(0.0f, 0.0f, -1.0f)));
++  const float3 area_right = math::normalize(
++      math::transform_direction(object_to_world, float3(1.0f, 0.0f, 0.0f)));
++  const float3 area_up = math::normalize(
++      math::transform_direction(object_to_world, float3(0.0f, 1.0f, 0.0f)));
++  const float scale_x = math::length(
++      math::transform_direction(object_to_world, float3(1.0f, 0.0f, 0.0f)));
++  const float scale_y = math::length(
++      math::transform_direction(object_to_world, float3(0.0f, 1.0f, 0.0f)));
++  const bool is_area = light->type == LA_AREA;
++  const bool is_irregular = is_area &&
++                            ELEM(light->area_shape, LA_AREA_RECT, LA_AREA_ELLIPSE);
++  const float area_size_x = max_ff(light->area_size * scale_x, 0.003f);
++  const float area_size_y = max_ff((is_irregular ? light->area_sizey : light->area_size) *
++                                       scale_y,
++                                   0.003f);
++  const float radius = is_area ? 0.0f : max_ff(light->radius, 0.001f);
++
++  LightRecord record = {};
++  record.position_type = float4(position, float(light->type));
++  record.direction_power = float4(forward, light->energy);
++  record.color_radius = float4(light->r, light->g, light->b, radius);
++  record.spot_flags = float4(light->spotsize, light->spotblend, area_size_x, area_size_y);
++  record.area_right = float4(area_right, float(light->area_shape));
++  record.area_up = float4(area_up, 0.0f);
++  lights_.append(record);
++}
++
++void PathTracingModule::object_sync(draw::ObjectRef &ob_ref)
++{
++  if (!enabled_) {
++    return;
++  }
++
++  if (ob_ref.object->type == OB_LAMP) {
++    light_sync(ob_ref);
++    return;
++  }
++
++  if (ob_ref.object->type != OB_MESH) {
++    return;
++  }
++
++  Object *ob = ob_ref.object;
++  Mesh *mesh = BKE_object_get_evaluated_mesh(ob);
++  if (mesh == nullptr) {
++    return;
++  }
++
++  const Span<int3> corner_tris = mesh->corner_tris();
++  const int triangle_count = corner_tris.size();
++  if (triangle_count <= 0) {
++    return;
++  }
++
++  const Span<float3> positions = mesh->vert_positions();
++  const Span<int> corner_verts = mesh->corner_verts();
++
++  /* The draw manager's BLAS is built from the face-sorted final IBO, while the primitive
++   * table below follows `corner_tris()`. Build a dedicated triangle-soup BLAS in the same
++   * order so `primitive_index` from the ray query indexes the matching normal/material. */
++  ObjectGeometry &geometry = geometry_.lookup_or_add(ob, ObjectGeometry{});
++  const bool rebuild_geometry = geometry.mesh != mesh ||
++                                geometry.positions != positions.data() ||
++                                geometry.corner_tris != corner_tris.data() ||
++                                !geometry.blas;
++  if (rebuild_geometry) {
++    geometry = ObjectGeometry{};
++    geometry.mesh = mesh;
++    geometry.positions = positions.data();
++    geometry.corner_tris = corner_tris.data();
++
++    const int vertex_count = triangle_count * 3;
++    const GPUVertFormat format = GPU_vertformat_from_attribute(
++        "pos", gpu::VertAttrType::SFLOAT_32_32_32);
++    geometry.vertex_buffer = gpu::VertBufPtr(GPU_vertbuf_create_with_format(format));
++    geometry.vertex_buffer->allocate(vertex_count);
++    MutableSpan<float3> verts = geometry.vertex_buffer->data<float3>();
++    for (const int tri_index : corner_tris.index_range()) {
++      const int3 &tri = corner_tris[tri_index];
++      verts[tri_index * 3 + 0] = positions[corner_verts[tri.x]];
++      verts[tri_index * 3 + 1] = positions[corner_verts[tri.y]];
++      verts[tri_index * 3 + 2] = positions[corner_verts[tri.z]];
++    }
++
++    Vector<uint32_t> indices(vertex_count);
++    for (int i = 0; i < vertex_count; i++) {
++      indices[i] = uint32_t(i);
++    }
++    geometry.index_buffer = gpu::IndexBufPtr(GPU_indexbuf_build_from_memory(
++        GPU_PRIM_TRIS, indices.data(), triangle_count, 0, vertex_count - 1, false));
++    GPU_vertbuf_use(geometry.vertex_buffer.get());
++    GPU_indexbuf_use(geometry.index_buffer.get());
++
++    geometry.blas = gpu::BottomLevelASPtr(GPU_ray_tracing_blas_alloc("PathTracingObjectBLAS"));
++    geometry.blas->add_geometry(*geometry.index_buffer, *geometry.vertex_buffer);
++    geometry.blas->build();
++  }
++  gpu::BottomLevelAS *blas = geometry.blas.get();
++
++  const int material_slot_count = ob->totcol;
++  const uint material_base = materials_.size();
++  for (int slot = 0; slot < material_slot_count; slot++) {
++    MaterialRecord material_record = {};
++    if (blender::Material *material = BKE_object_material_get_eval(ob, slot + 1)) {
++      float4 base_color = float4(material->r, material->g, material->b, 1.0f);
++      float roughness = material->roughness;
++      float metallic = material->metallic;
++      float transmission = 0.0f;
++      float ior = 1.5f;
++
++      if (const bNode *principled = principled_node(*material)) {
++        base_color = socket_color(*principled, "Base Color", base_color);
++        roughness = socket_float(*principled, "Roughness", roughness);
++        metallic = socket_float(*principled, "Metallic", metallic);
++        transmission = socket_float(*principled, "Transmission Weight", 0.0f);
++        ior = socket_float(*principled, "IOR", 1.5f);
++      }
++
++      material_record.base_color = base_color;
++      material_record.params = float4(roughness, metallic, transmission, ior);
++    }
++    else {
++      material_record.base_color = float4(0.8f, 0.8f, 0.8f, 1.0f);
++      material_record.params = float4(0.5f, 0.0f, 0.0f, 1.5f);
++    }
++    materials_.append(material_record);
++  }
++
++  const VArray<int> material_indices = *mesh->attributes().lookup_or_default<int>(
++      "material_index", bke::AttrDomain::Face, 0);
++
++  const uint primitive_offset = primitives_.size();
++  const Span<float3> corner_normals = mesh->corner_normals();
++  const Span<int> tri_faces = mesh->corner_tri_faces();
++  PrimitiveRecord primitive = {};
++  primitive.object_id = ob->index + 1;
++  primitive.geometry_index = 0;
++  for (const int tri_index : corner_tris.index_range()) {
++    const int3 &tri = corner_tris[tri_index];
++    const int face_index = tri_faces[tri_index];
++    const int material_slot = std::clamp(int(material_indices[face_index]),
++                                         0,
++                                         std::max(material_slot_count - 1, 0));
++    primitive.material_id = material_slot_count > 0 ? material_base + material_slot : 0;
++    const float3 v0 = positions[corner_verts[tri.x]];
++    const float3 v1 = positions[corner_verts[tri.y]];
++    const float3 v2 = positions[corner_verts[tri.z]];
++    const float3 face_normal = math::cross(v1 - v0, v2 - v0);
++    primitive.normal = math::length_squared(face_normal) > 1e-20f ?
++                           float4(math::normalize(face_normal), 0.0f) :
++                           float4(0.0f, 0.0f, 1.0f, 0.0f);
++    primitive.normal0 = float4(corner_normals[tri.x], 0.0f);
++    primitive.normal1 = float4(corner_normals[tri.y], 0.0f);
++    primitive.normal2 = float4(corner_normals[tri.z], 0.0f);
++    primitives_.append(primitive);
++  }
++
++  for (int i = 0; i < ob_ref.instances_count(); i++) {
++    const uint instance_id = instances_.size();
++    if (instance_id >= (1u << 24u)) {
++      break;
++    }
++
++    const float4x4 object_to_world = ob_ref.object_to_world(i);
++    const uint64_t history_key = (uint64_t(ob->index) << 32u) | uint(i);
++    const float4x4 *prev_transform = prev_object_to_world_.lookup_ptr(history_key);
++    const float4x4 prev_object_to_world = prev_transform ? *prev_transform : object_to_world;
++    current_object_to_world_.add_overwrite(history_key, object_to_world);
++    const gpu::InstanceID gpu_instance_id = tlas_->add_instance(
++        *blas, object_to_world, {instance_id, 0xFF});
++    if (gpu_instance_id.id < 0) {
++      continue;
++    }
++
++    InstanceRecord instance = {};
++    instance.object_to_world = object_to_world;
++    instance.prev_object_to_world = prev_object_to_world;
++    instance.primitive_offset = primitive_offset;
++    instance.primitive_count = triangle_count;
++    instance.object_id = primitive.object_id;
++    instance.visibility_mask = 0xFF;
++    instances_.append(instance);
++  }
++}
++
++void PathTracingModule::end_sync()
++{
++  if (!enabled_) {
++    return;
++  }
++
++  /* `Sampling::step()` clears the reset flag before the draw pass, so record it now. A
++   * viewport camera change cannot be represented by motion vectors and must not reuse the
++   * previous NRD/TAA history; otherwise the old view remains as ghost copies and a red
++   * halo around the sphere. */
++  if (inst_.is_viewport() && inst_.sampling.is_reset()) {
++    history_reset_pending_ = true;
++  }
++
++  tlas_->build();
++
++  data_buf_.instance_count = instances_.size();
++  data_buf_.primitive_count = primitives_.size();
++  data_buf_.material_count = materials_.size();
++  data_buf_.light_count = lights_.size();
++  data_buf_.background = float4(world_background(*inst_.scene), 1.0f);
++  data_buf_.push_update();
++
++  instance_buf_.resize(std::max<size_t>(1, instances_.size()));
++  for (int i = 0; i < instances_.size(); i++) {
++    instance_buf_[i] = instances_[i];
++  }
++  if (instances_.is_empty()) {
++    instance_buf_[0] = {};
++  }
++  instance_buf_.push_update();
++
++  primitive_buf_.resize(std::max<size_t>(1, primitives_.size()));
++  for (int i = 0; i < primitives_.size(); i++) {
++    primitive_buf_[i] = primitives_[i];
++  }
++  if (primitives_.is_empty()) {
++    primitive_buf_[0] = {};
++  }
++  primitive_buf_.push_update();
++
++  material_buf_.resize(std::max<size_t>(1, materials_.size()));
++  for (int i = 0; i < materials_.size(); i++) {
++    material_buf_[i] = materials_[i];
++  }
++  material_buf_.push_update();
++
++  light_buf_.resize(std::max<size_t>(1, lights_.size()));
++  for (int i = 0; i < lights_.size(); i++) {
++    light_buf_[i] = lights_[i];
++  }
++  if (lights_.is_empty()) {
++    light_buf_[0] = {};
++  }
++  light_buf_.push_update();
++
++  pass_.init();
++  pass_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_DEPTH_ALWAYS);
++  pass_.shader_set(shader_.get());
++  pass_.bind_ubo("pathtracing_data", &data_buf_);
++  pass_.bind_ssbo("instance_buf", &instance_buf_);
++  pass_.bind_ssbo("primitive_buf", &primitive_buf_);
++  pass_.bind_ssbo("material_buf", &material_buf_);
++  pass_.bind_ssbo("light_buf", &light_buf_);
++  pass_.bind_tlas("scene_as", tlas_.get());
++  pass_.bind_image("out_normal_roughness_img", &inst_.render_buffers.nrd_normal_roughness_tx);
++  pass_.bind_image("out_viewz_img", &inst_.render_buffers.nrd_viewz_tx);
++  pass_.bind_image("out_diffuse_img", &inst_.render_buffers.nrd_diffuse_tx);
++  pass_.bind_image("out_specular_img", &inst_.render_buffers.nrd_specular_tx);
++  pass_.bind_image("out_motion_img", &inst_.render_buffers.nrd_motion_tx);
++  pass_.bind_image("out_diff_factor_img", &inst_.render_buffers.nrd_diff_factor_tx);
++  pass_.bind_image("out_spec_factor_img", &inst_.render_buffers.nrd_spec_factor_tx);
++  pass_.bind_image("out_direct_img", &inst_.render_buffers.nrd_direct_tx);
++  pass_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
++
++  composite_pass_.init();
++  composite_pass_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_DEPTH_ALWAYS);
++  composite_pass_.shader_set(composite_shader_.get());
++  composite_pass_.bind_image("in_radiance_img", &inst_.render_buffers.nrd_diffuse_tx);
++  composite_pass_.bind_image("in_radiance_spec_img", &inst_.render_buffers.nrd_specular_tx);
++  composite_pass_.bind_image("in_denoised_img", &inst_.render_buffers.nrd_output_tx);
++  composite_pass_.bind_image("in_denoised_spec_img", &inst_.render_buffers.nrd_output_specular_tx);
++  composite_pass_.bind_image("in_diff_factor_img", &inst_.render_buffers.nrd_diff_factor_tx);
++  composite_pass_.bind_image("in_spec_factor_img", &inst_.render_buffers.nrd_spec_factor_tx);
++  composite_pass_.bind_image("in_direct_img", &inst_.render_buffers.nrd_direct_tx);
++  composite_pass_.bind_image("out_composed_img", &taa_composed_tx_);
++  composite_pass_.push_constant("denoising_range", 1.0e6f);
++  /* Newly added DNA fields read as zero in files saved before they existed. */
++  const int channels = inst_.scene->eevee.pathtracing_channels_initialized ?
++                           inst_.scene->eevee.pathtracing_channels :
++                           15;
++  const bool use_denoise = (channels & PATHTRACING_EEVEE_CHANNEL_DENOISE) != 0;
++  composite_pass_.push_constant(
++      "raw_only",
++      (!use_denoise || std::getenv("EEVEE_PT_NO_NRD")) ? 1.0f : 0.0f);
++  const char *debug_view_env = std::getenv("EEVEE_PT_DEBUG_VIEW");
++  const float debug_view = debug_view_env ? float(std::atoi(debug_view_env)) :
++                                            float(inst_.scene->eevee.pathtracing_debug_view);
++  composite_pass_.push_constant("debug_view", debug_view);
++  composite_pass_.push_constant(
++      "use_direct", (channels & PATHTRACING_EEVEE_CHANNEL_DIRECT) ? 1.0f : 0.0f);
++  composite_pass_.push_constant(
++      "use_diffuse", (channels & PATHTRACING_EEVEE_CHANNEL_DIFFUSE) ? 1.0f : 0.0f);
++  composite_pass_.push_constant(
++      "use_specular", (channels & PATHTRACING_EEVEE_CHANNEL_SPECULAR) ? 1.0f : 0.0f);
++  composite_pass_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
++
++  taa_pass_.init();
++  taa_pass_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_DEPTH_ALWAYS);
++  taa_pass_.shader_set(taa_shader_.get());
++  taa_pass_.bind_ubo("pathtracing_data", &data_buf_);
++  taa_pass_.bind_image("in_composed_img", &taa_composed_tx_);
++  taa_pass_.bind_image("in_motion_img", &inst_.render_buffers.nrd_motion_tx);
++  taa_pass_.bind_image("in_history_img", &taa_history_prev_tx_);
++  taa_pass_.bind_image("out_history_img", &taa_history_next_tx_);
++  taa_pass_.bind_image("in_viewz_img", &inst_.render_buffers.nrd_viewz_tx);
++  taa_pass_.push_constant("debug_motion",
++                          std::getenv("EEVEE_PT_DEBUG_MOTION") ? 1.0f : 0.0f);
++  taa_pass_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
++}
++
++void PathTracingModule::render(draw::View &view,
++                               draw::View &main_view,
++                               draw::Framebuffer &combined_fb,
++                               const float2 &camera_jitter)
++{
++  if (!enabled_) {
++    return;
++  }
++
++  const float4x4 world_to_view = view.viewmat();
++  const float4x4 view_to_clip = view.winmat();
++  /* NRD requires non-jittered projection matrices. The main view is the unjittered one. */
++  const float4x4 nrd_world_to_view = main_view.viewmat();
++  const float4x4 nrd_view_to_clip = main_view.winmat();
++  if (!has_prev_) {
++    prev_world_to_view_ = world_to_view;
++    prev_view_to_clip_ = view_to_clip;
++    prev_jitter_ = camera_jitter;
++    has_prev_ = true;
++  }
++
++  const int2 extent = inst_.render_buffers.extent_get();
++  data_buf_.resolution = uint2(extent);
++  data_buf_.sample_index = uint(inst_.sampling.sample_index());
++  data_buf_.pad0 = uint(std::getenv("EEVEE_PT_DEBUG_FLAGS") ?
++                            std::atoi(std::getenv("EEVEE_PT_DEBUG_FLAGS")) :
++                            0);
++  /* Preserve NRD history through object edits and camera navigation, like NRD-Sample. The
++   * denoiser rejects stale history through motion vectors and normal/depth tests. Only a new
++   * session, a resolution change or a non-sequential still render starts a new session. */
++  const bool resolution_changed = extent != nrd_extent_;
++  bool frame_jump = false;
++  if (!inst_.is_viewport() && data_buf_.sample_index == 0) {
++    const int frame = inst_.scene->r.cfra;
++    frame_jump = (frame != last_render_frame_ + 1);
++    last_render_frame_ = frame;
++  }
++  /* Sampling restarts at 0 whenever the viewport camera or the scene changes. NRD/TAA
++   * history from the previous camera position must not be reprojected into the new view:
++   * the motion vectors cannot describe a teleporting camera, and the stale history shows up
++   * as ghost copies of the scene and as a red halo around the sphere. */
++  const bool pending_reset = history_reset_pending_;
++  const bool sampling_reset = data_buf_.sample_index == 0 || pending_reset;
++  history_reset_pending_ = false;
++  const bool new_session = !nrd_session_started_ || resolution_changed || frame_jump ||
++                           sampling_reset;
++  if (std::getenv("EEVEE_PT_DEBUG_RESET")) {
++    printf("PTDBG viewport=%d sample=%u pending=%d sampling_reset=%d new_session=%d "
++           "res_changed=%d frame_jump=%d extent=%dx%d\n",
++           int(inst_.is_viewport()), uint(data_buf_.sample_index), int(pending_reset),
++           int(sampling_reset), int(new_session), int(resolution_changed), int(frame_jump),
++           extent.x, extent.y);
++    fflush(stdout);
++  }
++  const bool disable_taa = std::getenv("EEVEE_PT_NO_TAA") != nullptr;
++  nrd_session_started_ = true;
++  nrd_extent_ = extent;
++  if (new_session) {
++    taa_history_valid_ = false;
++    prev_jitter_ = camera_jitter;
++  }
++  if (disable_taa) {
++    taa_history_valid_ = false;
++  }
++
++  const eGPUTextureUsage taa_usage = eGPUTextureUsage(GPU_TEXTURE_USAGE_SHADER_READ |
++                                                      GPU_TEXTURE_USAGE_SHADER_WRITE);
++  taa_composed_tx_.ensure_2d(gpu::TextureFormat::SFLOAT_16_16_16_16, extent, taa_usage);
++  const bool history_a_created = taa_history_a_tx_.ensure_2d(
++      gpu::TextureFormat::SFLOAT_16_16_16_16, extent, taa_usage);
++  const bool history_b_created = taa_history_b_tx_.ensure_2d(
++      gpu::TextureFormat::SFLOAT_16_16_16_16, extent, taa_usage);
++  if (history_a_created || history_b_created) {
++    taa_history_valid_ = false;
++  }
++
++  data_buf_.taa_history_valid = taa_history_valid_ ? 1u : 0u;
++  data_buf_.prev_world_to_view = prev_world_to_view_;
++  data_buf_.prev_view_to_clip = prev_view_to_clip_;
++  data_buf_.curr_jitter = camera_jitter;
++  data_buf_.prev_jitter = prev_jitter_;
++  data_buf_.push_update();
++
++  combined_fb.bind();
++  inst_.manager->submit(pass_, view);
++
++  prev_world_to_view_ = world_to_view;
++  prev_view_to_clip_ = view_to_clip;
++
++#ifdef WITH_VULKAN_BACKEND
++  if (GPU_backend_get_type() == GPU_BACKEND_VULKAN) {
++    GPU_finish();
++
++    gpu::NrdDenoiseInput nrd_input;
++    nrd_input.color = inst_.render_buffers.nrd_diffuse_tx;
++    nrd_input.specular = inst_.render_buffers.nrd_specular_tx;
++    nrd_input.normal_roughness = inst_.render_buffers.nrd_normal_roughness_tx;
++    nrd_input.viewz = inst_.render_buffers.nrd_viewz_tx;
++    nrd_input.motion = inst_.render_buffers.nrd_motion_tx;
++    nrd_input.output = inst_.render_buffers.nrd_output_tx;
++    nrd_input.output_specular = inst_.render_buffers.nrd_output_specular_tx;
++    nrd_input.width = inst_.render_buffers.extent_get().x;
++    nrd_input.height = inst_.render_buffers.extent_get().y;
++    nrd_input.view_to_clip = nrd_view_to_clip.base_ptr();
++    nrd_input.world_to_view = nrd_world_to_view.base_ptr();
++    nrd_input.denoising_range = 1.0e6f;
++    /* NRD expects the jitter offset from the pixel center in pixels, in [-0.5; 0.5] (see
++     * NRDSettings.h / NRD-Sample's viewportJitter). Blender's film jitter uses the same units. */
++    nrd_input.camera_jitter[0] = camera_jitter.x;
++    nrd_input.camera_jitter[1] = camera_jitter.y;
++    nrd_input.camera_jitter_prev[0] = prev_jitter_.x;
++    nrd_input.camera_jitter_prev[1] = prev_jitter_.y;
++    nrd_input.reset_history = new_session ||
++                              std::getenv("EEVEE_PT_NO_NRD_HISTORY") != nullptr;
++
++    const bool disable_nrd = std::getenv("EEVEE_PT_NO_NRD") != nullptr;
++    const bool denoised = !disable_nrd && gpu::nrd_denoise(nrd_input);
++    if (denoised || disable_nrd) {
++      /* REBLUR does not write sky pixels (outside of the denoising range). Composite the raw
++       * path traced radiance back for those pixels instead of copying the full denoised image. */
++      combined_fb.bind();
++      inst_.manager->submit(composite_pass_, view);
++
++      /* Final temporal accumulation. The pass bindings reference these pointers, so update the
++       * ping-pong roles before submitting the pass. */
++      gpu::Texture *history_a = taa_history_a_tx_.gpu_texture();
++      gpu::Texture *history_b = taa_history_b_tx_.gpu_texture();
++      if ((taa_history_index_ & 1u) == 0u) {
++        taa_history_prev_tx_ = history_a;
++        taa_history_next_tx_ = history_b;
++      }
++      else {
++        taa_history_prev_tx_ = history_b;
++        taa_history_next_tx_ = history_a;
++      }
++      combined_fb.bind();
++      inst_.manager->submit(taa_pass_, view);
++      taa_history_index_ ^= 1u;
++      taa_history_valid_ = true;
++    }
++    prev_jitter_ = camera_jitter;
++  }
++#endif
++
++  /* Publish this frame's transforms for the next frame's motion vectors. */
++  prev_object_to_world_ = current_object_to_world_;
++}
++
++}  // namespace blender::eevee
+diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing.hh b/source/blender/draw/engines/eevee/eevee_pathtracing.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..e86e3803322e02e14d1ed2f36a912c0050309dd2
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/eevee_pathtracing.hh
+@@ -0,0 +1,121 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Path tracing scene data and the M1 debug hit pass.
++ */
++
++#pragma once
++
++#include "BLI_map.hh"
++#include "BLI_vector.hh"
++
++#include "DRW_gpu_wrapper.hh"
++#include "GPU_index_buffer.hh"
++#include "GPU_ray_tracing.hh"
++#include "GPU_shader.hh"
++#include "GPU_vertex_buffer.hh"
++#include "draw_pass.hh"
++
++#include "eevee_pathtracing_shared.hh"
++
++struct Object;
++struct Mesh;
++
++namespace blender::eevee {
++
++class Instance;
++
++class PathTracingModule {
++ private:
++  struct ObjectGeometry {
++    gpu::BottomLevelASPtr blas;
++    gpu::VertBufPtr vertex_buffer;
++    gpu::IndexBufPtr index_buffer;
++    const Mesh *mesh = nullptr;
++    const void *positions = nullptr;
++    const void *corner_tris = nullptr;
++  };
++
++  Instance &inst_;
++
++  bool enabled_ = false;
++
++  gpu::TopLevelASPtr tlas_;
++  Map<const Object *, ObjectGeometry> geometry_;
++
++  draw::UniformBuffer<PathTracingData> data_buf_{"PathTracingData"};
++  draw::StorageArrayBuffer<InstanceRecord, 1> instance_buf_{"PathTracingInstanceBuf"};
++  draw::StorageArrayBuffer<PrimitiveRecord, 1> primitive_buf_{"PathTracingPrimitiveBuf"};
++  draw::StorageArrayBuffer<MaterialRecord, 1> material_buf_{"PathTracingMaterialBuf"};
++  draw::StorageArrayBuffer<LightRecord, 1> light_buf_{"PathTracingLightBuf"};
++
++  Vector<InstanceRecord> instances_;
++  Vector<PrimitiveRecord> primitives_;
++  Vector<MaterialRecord> materials_;
++  Vector<LightRecord> lights_;
++
++  float4x4 prev_world_to_view_;
++  float4x4 prev_view_to_clip_;
++  bool has_prev_ = false;
++
++  /* Object transforms keyed by object index and instance, for object motion vectors.
++   * `current_` is filled during sync and becomes `prev_` after the frame is submitted, so
++   * `prev_` always matches the last rendered frame even if sync runs multiple times. */
++  Map<uint64_t, float4x4> prev_object_to_world_;
++  Map<uint64_t, float4x4> current_object_to_world_;
++
++  /* NRD history is preserved across object edits. It is reset for a new session, a
++   * resolution change, a non-sequential still render, or a viewport sampling reset. The
++   * last case covers camera navigation: EEVEE clears its sampling state before the draw
++   * pass, so `end_sync()` records it here for the following `render()`. */
++  bool nrd_session_started_ = false;
++  int2 nrd_extent_ = int2(0);
++  int last_render_frame_ = -1;
++  bool history_reset_pending_ = false;
++  float2 prev_jitter_ = float2(0.0f);
++
++  /* Final temporal accumulation, following the NRD-Sample TAA pass. The composite writes its
++   * result to `taa_composed_tx_`, and TAA resolves it into the render result while storing the
++   * history in one of two ping-pong textures. */
++  draw::Texture taa_composed_tx_ = {"PathTracingTAAComposed"};
++  draw::Texture taa_history_a_tx_ = {"PathTracingTAAHistoryA"};
++  draw::Texture taa_history_b_tx_ = {"PathTracingTAAHistoryB"};
++  gpu::Texture *taa_history_prev_tx_ = nullptr;
++  gpu::Texture *taa_history_next_tx_ = nullptr;
++  uint taa_history_index_ = 0;
++  bool taa_history_valid_ = false;
++
++  draw::PassMain pass_{"PathTracing.Debug"};
++  gpu::StaticShader shader_{"eevee_pathtracing_debug"};
++
++  draw::PassSimple composite_pass_{"PathTracing.Composite"};
++  gpu::StaticShader composite_shader_{"eevee_pathtracing_composite"};
++
++  draw::PassSimple taa_pass_{"PathTracing.TAA"};
++  gpu::StaticShader taa_shader_{"eevee_pathtracing_taa"};
++
++ public:
++  PathTracingModule(Instance &inst) : inst_(inst) {}
++
++  void begin_sync();
++  void object_sync(draw::ObjectRef &ob_ref);
++  void end_sync();
++  void render(draw::View &view,
++              draw::View &main_view,
++              draw::Framebuffer &combined_fb,
++              const float2 &camera_jitter);
++
++  bool enabled() const
++  {
++    return enabled_;
++  }
++
++ private:
++  void light_sync(draw::ObjectRef &ob_ref);
++};
++
++}  // namespace blender::eevee
+diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh b/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ff3ecc1eb55580f1f3ff7eb685eeaab3ecf2132
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh
+@@ -0,0 +1,103 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Shared path tracing scene data between host and shader code.
++ */
++
++#pragma once
++
++#include "GPU_shader_shared_utils.hh"
++
++#ifndef GPU_SHADER
++namespace blender::eevee {
++#endif
++
++struct [[host_shared]] PathTracingData {
++  uint2 resolution;
++  uint instance_count;
++  uint primitive_count;
++  uint material_count;
++  uint light_count;
++  uint sample_index;
++  uint pad0;
++  float4 background;
++  float4x4 prev_world_to_view;
++  float4x4 prev_view_to_clip;
++  uint max_bounces;
++  float clamp_direct;
++  float clamp_indirect;
++  /* Non-zero when the TAA history texture contains a valid previous frame. */
++  uint taa_history_valid;
++  /* Sub-pixel camera jitters of the current and previous frame, in render pixels. */
++  float2 curr_jitter;
++  float2 prev_jitter;
++  float2 pad1;
++  float2 pad2;
++};
++
++struct [[host_shared]] InstanceRecord {
++  float4x4 object_to_world;
++  /* Object transform at the previous frame, used for object motion vectors and history
++   * reprojection. Equal to `object_to_world` for static objects or on the first frame. */
++  float4x4 prev_object_to_world;
++  uint primitive_offset;
++  uint primitive_count;
++  uint material_table_offset;
++  uint object_id;
++  uint visibility_mask;
++  uint flags;
++  uint pad0;
++  uint pad1;
++};
++
++struct [[host_shared]] PrimitiveRecord {
++  float4 normal;
++  float4 normal0;
++  float4 normal1;
++  float4 normal2;
++  uint material_id;
++  uint object_id;
++  uint geometry_index;
++  uint flags;
++  float area;
++  uint uv_layer_offset;
++  uint attribute_offset;
++  uint pad0;
++};
++
++struct [[host_shared]] MaterialRecord {
++  float4 base_color;
++  /* x = roughness, y = metallic, zw = reserved. */
++  float4 params;
++  uint closure_offset;
++  uint closure_count;
++  uint texture_offset;
++  uint object_info_offset;
++  uint aov_offset;
++  uint flags;
++  uint pad0;
++  uint pad1;
++};
++
++struct [[host_shared]] LightRecord {
++  /* xyz = world position, w = light type (eLightType). */
++  float4 position_type;
++  /* xyz = world forward direction, w = power / sun strength. */
++  float4 direction_power;
++  /* rgb = light color, a = point/spot radius. */
++  float4 color_radius;
++  /* x = spot size, y = spot blend, z = area size X, w = area size Y. */
++  float4 spot_flags;
++  /* xyz = area light local X axis in world, w = eLightAreaShape. */
++  float4 area_right;
++  /* xyz = area light local Y axis in world, w = pad. */
++  float4 area_up;
++};
++
++#ifndef GPU_SHADER
++}  // namespace blender::eevee
++#endif
+diff --git a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
+index ca9abfbd84189660277761008c6a4f9460525360..5520f6c132527bb6a3e168b97b51bf366f3051a1 100644
+--- a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
++++ b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
+@@ -85,6 +85,19 @@ void RenderBuffers::acquire(int2 extent, gpu::TextureFormat raycast_depth_format
+                                                  GPU_TEXTURE_USAGE_SHADER_READ |
+                                                  GPU_TEXTURE_USAGE_SHADER_WRITE;
+ 
++  const int2 nrd_extent = inst_.path_tracing.enabled() ? extent : int2(1);
++  nrd_normal_roughness_tx.acquire_2d(
++      nrd_extent, nrd_normal_roughness_format, usage_attachment_read_write);
++  nrd_viewz_tx.acquire_2d(nrd_extent, nrd_viewz_format, usage_attachment_read_write);
++  nrd_diffuse_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_specular_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_motion_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_output_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_output_specular_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_diff_factor_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_spec_factor_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++  nrd_direct_tx.acquire_2d(nrd_extent, color_format, usage_attachment_read_write);
++
+   /* TODO(fclem): Make vector pass allocation optional if no TAA or motion blur is needed. */
+   vector_tx.acquire_2d(extent, vector_tx_format(), usage_attachment_read_write);
+   if (inst_.pipelines.has_raycast) {
+@@ -129,6 +142,16 @@ void RenderBuffers::release()
+ {
+   depth_tx.release();
+   combined_tx.release();
++  nrd_normal_roughness_tx.release();
++  nrd_viewz_tx.release();
++  nrd_diffuse_tx.release();
++  nrd_specular_tx.release();
++  nrd_motion_tx.release();
++  nrd_output_tx.release();
++  nrd_output_specular_tx.release();
++  nrd_diff_factor_tx.release();
++  nrd_spec_factor_tx.release();
++  nrd_direct_tx.release();
+ 
+   const bool do_motion_vectors_swizzle = vector_tx_format() == gpu::TextureFormat::SFLOAT_16_16;
+   if (do_motion_vectors_swizzle) {
+diff --git a/source/blender/draw/engines/eevee/eevee_renderbuffers.hh b/source/blender/draw/engines/eevee/eevee_renderbuffers.hh
+index 0359a34d083c5c8d705449776fb8974f31e20915..895aa9feccc03df498f1a537fceb4cb83d1462ea 100644
+--- a/source/blender/draw/engines/eevee/eevee_renderbuffers.hh
++++ b/source/blender/draw/engines/eevee/eevee_renderbuffers.hh
+@@ -29,10 +29,26 @@ class RenderBuffers {
+   static constexpr gpu::TextureFormat depth_format = gpu::TextureFormat::SFLOAT_32_DEPTH_UINT_8;
+   static constexpr gpu::TextureFormat object_id_format = gpu::TextureFormat::UINT_16;
+   static constexpr gpu::TextureFormat prepass_normal_format = gpu::TextureFormat::UNORM_10_10_10_2;
++  static constexpr gpu::TextureFormat nrd_normal_roughness_format = gpu::TextureFormat::UNORM_10_10_10_2;
++  static constexpr gpu::TextureFormat nrd_viewz_format = gpu::TextureFormat::SFLOAT_32;
+ 
+   TextureFromPool depth_tx;
+   TextureFromPool combined_tx;
+ 
++  /* NRD guide and denoiser buffers, written by the path tracing pass. */
++  TextureFromPool nrd_normal_roughness_tx;
++  TextureFromPool nrd_viewz_tx;
++  TextureFromPool nrd_diffuse_tx;
++  TextureFromPool nrd_specular_tx;
++  TextureFromPool nrd_motion_tx;
++  TextureFromPool nrd_output_tx;
++  TextureFromPool nrd_output_specular_tx;
++  /* Per-pixel material demodulation factors, applied after denoising. */
++  TextureFromPool nrd_diff_factor_tx;
++  TextureFromPool nrd_spec_factor_tx;
++  /* Primary-surface direct lighting, added after denoising. */
++  TextureFromPool nrd_direct_tx;
++
+   // TextureFromPool mist_tx; /* Derived from depth_tx during accumulation. */
+   TextureFromPool vector_tx;
+   TextureFromPool raycast_depth_tx;
+diff --git a/source/blender/draw/engines/eevee/eevee_view.cc b/source/blender/draw/engines/eevee/eevee_view.cc
+index 67126e73a72f93d3f86036ca8f30f2a81ff9ed31..fc904bfc62a866d548130c5edf5230e6f0fbcd98 100644
+--- a/source/blender/draw/engines/eevee/eevee_view.cc
++++ b/source/blender/draw/engines/eevee/eevee_view.cc
+@@ -176,6 +176,8 @@ void ShadingView::render()
+   inst_.sphere_probes.viewport_draw(render_view_, combined_fb_);
+   inst_.planar_probes.viewport_draw(render_view_, combined_fb_);
+ 
++  inst_.path_tracing.render(render_view_, main_view_, combined_fb_, render_jitter_);
++
+   gpu::Texture *combined_final_tx = render_postfx(rbufs.combined_tx);
+   inst_.film.accumulate(jitter_view_, combined_final_tx);
+ 
+@@ -273,7 +275,8 @@ void ShadingView::update_view()
+   }
+ 
+   /* Anti-Aliasing / Super-Sampling jitter. */
+-  float2 jitter = inst_.film.pixel_jitter_get() / float2(extent_);
++  render_jitter_ = inst_.film.pixel_jitter_get();
++  float2 jitter = render_jitter_ / float2(extent_);
+   /* Transform to NDC space. */
+   jitter *= 2.0f;
+ 
+diff --git a/source/blender/draw/engines/eevee/eevee_view.hh b/source/blender/draw/engines/eevee/eevee_view.hh
+index c05946b8f13a78980a3d6f06ec020ead0f0ea556..a595e433328fe525943d2d6baf19aabdaf7ef49c 100644
+--- a/source/blender/draw/engines/eevee/eevee_view.hh
++++ b/source/blender/draw/engines/eevee/eevee_view.hh
+@@ -69,6 +69,9 @@ class ShadingView {
+   /** Render size of the view. Can change between scene sample eval. */
+   int2 extent_ = {-1, -1};
+ 
++  /** Sub-pixel jitter used by the jittered views this frame, in render pixels. */
++  float2 render_jitter_ = float2(0.0f);
++
+   bool is_enabled_ = false;
+ 
+  public:
+diff --git a/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc b/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
+index 77ba89520c7d54d87364983ea75bbd48d06ed9bc..e187af611c5a8e1e46f3416c4e6fbde494da69e8 100644
+--- a/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
++++ b/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
+@@ -78,6 +78,7 @@
+ #include "eevee_occupancy_convert.bsl.hh"            /* IWYU pragma: export */
+ #include "eevee_occupancy_lib.bsl.hh"                /* IWYU pragma: export */
+ #include "eevee_octahedron_lib.bsl.hh"               /* IWYU pragma: export */
++#include "eevee_pathtracing_debug.bsl.hh"            /* IWYU pragma: export */
+ #include "eevee_pipeline.bsl.hh"                     /* IWYU pragma: export */
+ #include "eevee_ray_denoise.bsl.hh"                  /* IWYU pragma: export */
+ #include "eevee_ray_generate.bsl.hh"                 /* IWYU pragma: export */
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d7e9c558bd03b40c852a013aa1bdf26cc26342b
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh
+@@ -0,0 +1,137 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Composites the denoised path tracing result with the raw radiance for sky pixels.
++ *
++ * NRD denoisers do not write output pixels outside of the denoising range (sky).
++ * For those pixels the raw path traced radiance must be used instead, matching
++ * the reference composition in the NRD sample.
++ */
++
++#pragma once
++
++#include "gpu_shader_fullscreen.bsl.hh"
++
++namespace eevee::pathtracing {
++
++struct CompositeResources {
++  /* Raw indirect path traced radiance (RGB) and path hit distance (A). */
++  [[image(0, read, SFLOAT_16_16_16_16)]] const image2D in_radiance_img;
++  /* NRD denoised indirect radiance (RGB). */
++  [[image(1, read, SFLOAT_16_16_16_16)]] const image2D in_denoised_img;
++  /* NRD denoised specular indirect radiance (RGB). */
++  [[image(2, read, SFLOAT_16_16_16_16)]] const image2D in_denoised_spec_img;
++  /* Raw specular indirect path traced radiance (RGB) and path hit distance (A). */
++  [[image(3, read, SFLOAT_16_16_16_16)]] const image2D in_radiance_spec_img;
++  /* Demodulation factors stored by the path tracing pass. */
++  [[image(4, read, SFLOAT_16_16_16_16)]] const image2D in_diff_factor_img;
++  [[image(5, read, SFLOAT_16_16_16_16)]] const image2D in_spec_factor_img;
++  /* Primary-surface direct lighting (RGB). A stores linear view-space Z, negative for
++   * Blender's right-handed view space. */
++  [[image(6, read, SFLOAT_16_16_16_16)]] const image2D in_direct_img;
++  /* Must match the denoising range passed to NRD. */
++  [[push_constant]] const float denoising_range;
++  /* Debug path: bypass the denoised inputs and use the raw path traced signal. */
++  [[push_constant]] const float raw_only;
++  /* Debug channel selector. 0 = normal composition. */
++  [[push_constant]] const float debug_view;
++  /* Channel toggles for the final composition. */
++  [[push_constant]] const float use_direct;
++  [[push_constant]] const float use_diffuse;
++  [[push_constant]] const float use_specular;
++  /* Composite result for the final TAA pass. A stores 1 for written pixels. */
++  [[image(7, write, SFLOAT_16_16_16_16)]] image2D out_composed_img;
++};
++
++/* REBLUR operates in YCoCg space: the path tracing pass encodes its denoiser input and writes the
++ * denoised output in the same encoding. Convert back to linear before remodulating. */
++float3 ycocg_to_linear(float3 color)
++{
++  const float t = color.x - color.z;
++  return max(float3(t + color.y, color.x + color.z, t - color.y), float3(0.0f));
++}
++
++[[vertex]] void composite_vert([[vertex_id]] const int vert_id, [[position]] float4 &out_pos)
++{
++  fullscreen_vertex(vert_id, out_pos);
++}
++
++[[fragment]] void composite_frag([[frag_coord]] const float4 frag_co,
++                                 [[resource_table]] CompositeResources &srt)
++{
++  const int2 texel = int2(frag_co.xy);
++  const float4 raw = imageLoad(srt.in_radiance_img, texel);
++  const float4 raw_spec = imageLoad(srt.in_radiance_spec_img, texel);
++  const float4 denoised = imageLoad(srt.in_denoised_img, texel);
++  const float4 denoised_spec = imageLoad(srt.in_denoised_spec_img, texel);
++  const float3 diff_factor = imageLoad(srt.in_diff_factor_img, texel).rgb;
++  const float3 spec_factor = imageLoad(srt.in_spec_factor_img, texel).rgb;
++  const float4 direct = imageLoad(srt.in_direct_img, texel);
++  const float viewz = direct.w;
++  const bool is_sky = abs(viewz) >= srt.denoising_range;
++  if (srt.debug_view > 0.5f) {
++    float3 debug_color = float3(0.0f);
++    const float mode = srt.debug_view;
++    if (mode < 1.5f) {
++      debug_color = ycocg_to_linear(denoised.rgb) * diff_factor;
++    }
++    else if (mode < 2.5f) {
++      debug_color = ycocg_to_linear(denoised_spec.rgb) * spec_factor;
++    }
++    else if (mode < 3.5f) {
++      debug_color = ycocg_to_linear(raw.rgb) * diff_factor;
++    }
++    else if (mode < 4.5f) {
++      debug_color = ycocg_to_linear(raw_spec.rgb) * spec_factor;
++    }
++    else if (mode < 5.5f) {
++      debug_color = float3(raw.a);
++    }
++    else if (mode < 6.5f) {
++      debug_color = float3(raw_spec.a);
++    }
++    else if (mode < 7.5f) {
++      debug_color = ycocg_to_linear(denoised.rgb) * diff_factor +
++                     ycocg_to_linear(denoised_spec.rgb) * spec_factor;
++    }
++    else if (mode < 8.5f) {
++      debug_color = direct.rgb;
++    }
++    imageStore(srt.out_composed_img, texel, float4(debug_color, 1.0f));
++    return;
++  }
++  /* RELAX classifies sky per 16x16 tile (all 256 pixels must be sky) and leaves skipped
++   * tiles unwritten (exact zeros). Near silhouettes a tile can flip between sky and mixed
++   * from frame to frame, so geometry pixels inside a skipped tile would otherwise be black.
++   * Fall back to the raw path traced radiance whenever NRD did not write the pixel. */
++  const bool denoised_valid = (denoised.x + denoised.y + denoised.z +
++                               denoised_spec.x + denoised_spec.y + denoised_spec.z) != 0.0f;
++  /* Remodulate by the per-pixel factors removed before denoising. Both raw and denoised signals
++   * use the REBLUR YCoCg encoding. */
++  float3 composed_diff = ycocg_to_linear(denoised.rgb) * diff_factor;
++  float3 composed_spec = ycocg_to_linear(denoised_spec.rgb) * spec_factor;
++  if (srt.raw_only != 0.0f || is_sky || !denoised_valid) {
++    composed_diff = ycocg_to_linear(raw.rgb) * diff_factor;
++    composed_spec = ycocg_to_linear(raw_spec.rgb) * spec_factor;
++  }
++  /* Direct lighting bypasses the denoiser, matching the NRD sample composition. */
++  float3 radiance = float3(0.0f);
++  if (srt.use_diffuse != 0.0f) {
++    radiance += composed_diff;
++  }
++  if (srt.use_specular != 0.0f) {
++    radiance += composed_spec;
++  }
++  if (srt.use_direct != 0.0f) {
++    radiance += direct.rgb;
++  }
++  imageStore(srt.out_composed_img, texel, float4(radiance, 1.0f));
++}
++
++PipelineGraphic composite(composite_vert, composite_frag);
++
++}  // namespace eevee::pathtracing
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f33941d0edf4c731413c6027c9195caaa232224d
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
+@@ -0,0 +1,876 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Hardware ray tracing path tracing pass.
++ */
++
++#pragma once
++
++#include "draw_view.bsl.hh"
++#include "eevee_pathtracing_shared.hh"
++#include "gpu_shader_fullscreen.bsl.hh"
++
++namespace eevee::pathtracing {
++
++struct Resources {
++  [[uniform(1)]] const PathTracingData &pathtracing_data;
++  [[storage(0, read)]] const InstanceRecord (&instance_buf)[];
++  [[storage(1, read)]] const PrimitiveRecord (&primitive_buf)[];
++  [[storage(2, read)]] const MaterialRecord (&material_buf)[];
++  [[storage(3, read)]] const LightRecord (&light_buf)[];
++  [[acceleration_structure(0)]] const accelerationStructure scene_as;
++  [[image(0, write, UNORM_10_10_10_2)]] image2D out_normal_roughness_img;
++  [[image(1, write, SFLOAT_32)]] image2D out_viewz_img;
++  [[image(2, write, SFLOAT_16_16_16_16)]] image2D out_diffuse_img;
++  [[image(3, write, SFLOAT_16_16_16_16)]] image2D out_motion_img;
++  [[image(4, write, SFLOAT_16_16_16_16)]] image2D out_specular_img;
++  [[image(5, write, SFLOAT_16_16_16_16)]] image2D out_diff_factor_img;
++  [[image(6, write, SFLOAT_16_16_16_16)]] image2D out_spec_factor_img;
++  /* Primary-surface direct lighting (RGB), added after denoising like the NRD sample.
++   * A stores view-space Z for the composite pass. */
++  [[image(7, write, SFLOAT_16_16_16_16)]] image2D out_direct_img;
++};
++
++struct PathtracingFragOut {
++  [[frag_color(0)]] float4 color;
++};
++
++float3 safe_normalize(float3 v, float3 fallback)
++{
++  float len_sq = dot(v, v);
++  if (len_sq < 1e-12f) {
++    return fallback;
++  }
++  return v * (1.0f / sqrt(len_sq));
++}
++
++/* Matches NRD's default R10G10B10A2 normal/roughness encoding. The alpha channel stores the
++ * NRD material ID in [0,1], where the NRD sample uses 0 = default, 1/3 = metal. */
++float4 pack_normal_roughness(float3 n, float roughness, float material_id)
++{
++  n /= abs(n.x) + abs(n.y) + abs(n.z);
++  float3 r;
++  r.y = n.y * 0.5f + 0.5f;
++  r.x = n.x * 0.5f + r.y;
++  r.y -= n.x * 0.5f;
++  roughness = max(roughness, 1.5f / 512.0f);
++  const float s = n.z < 0.0f ? -roughness : roughness;
++  r.z = s * 0.5f + 0.5f;
++  return float4(r, saturate(material_id / 3.0f));
++}
++
++uint hash_u32(uint x)
++{
++  x ^= x >> 16u;
++  x *= 0x7feb352du;
++  x ^= x >> 15u;
++  x *= 0x846ca68bu;
++  x ^= x >> 16u;
++  return x;
++}
++
++struct Rng {
++  uint state;
++  float next()
++  {
++    state = state * 747796405u + 2891336453u;
++    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
++    return float((word >> 22u) ^ word) * (1.0f / 4294967295.0f);
++  }
++};
++
++float3 sample_cosine_hemisphere(float u1, float u2, float3 normal)
++{
++  const float3 up = abs(normal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
++  const float3 tangent = safe_normalize(cross(up, normal), float3(1.0f, 0.0f, 0.0f));
++  const float3 bitangent = cross(normal, tangent);
++  const float radius = sqrt(u1);
++  const float phi = 2.0f * 3.14159265358979323846f * u2;
++  return safe_normalize(tangent * (radius * cos(phi)) + bitangent * (radius * sin(phi)) +
++                            normal * sqrt(max(0.0f, 1.0f - u1)),
++                        normal);
++}
++
++float3 sample_sphere_direction(float u1, float u2)
++{
++  const float z = 1.0f - 2.0f * u1;
++  const float radius = sqrt(max(0.0f, 1.0f - z * z));
++  const float phi = 2.0f * 3.14159265358979323846f * u2;
++  return float3(radius * cos(phi), radius * sin(phi), z);
++}
++
++float3 fresnel_schlick(float3 f0, float vdot_h)
++{
++  return f0 + (float3(1.0f) - f0) * pow(1.0f - saturate(vdot_h), 5.0f);
++}
++
++float ggx_distribution(float ndot_h, float alpha2)
++{
++  const float denom = ndot_h * ndot_h * (alpha2 - 1.0f) + 1.0f;
++  return alpha2 / max(3.14159265358979323846f * denom * denom, 1e-7f);
++}
++
++float smith_g1(float ndot_x, float alpha2)
++{
++  return 2.0f * ndot_x / max(ndot_x + sqrt(alpha2 + (1.0f - alpha2) * ndot_x * ndot_x), 1e-5f);
++}
++
++float3 sample_ggx_half_vector(float u1, float u2, float3 normal, float alpha2)
++{
++  const float3 up = abs(normal.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
++  const float3 tangent = safe_normalize(cross(up, normal), float3(1.0f, 0.0f, 0.0f));
++  const float3 bitangent = cross(normal, tangent);
++  const float cos_theta = sqrt(max((1.0f - u1) / (1.0f + (alpha2 - 1.0f) * u1), 0.0f));
++  const float sin_theta = sqrt(max(0.0f, 1.0f - cos_theta * cos_theta));
++  const float phi = 2.0f * 3.14159265358979323846f * u2;
++  return safe_normalize(tangent * (sin_theta * cos(phi)) + bitangent * (sin_theta * sin(phi)) +
++                            normal * cos_theta,
++                        normal);
++}
++
++float max_component(float3 v)
++{
++  return max(v.x, max(v.y, v.z));
++}
++
++/* Intersect a ray with a Blender area light's emitting plane. Used for BSDF-sampled
++ * direct specular, which has much lower variance than uniform area sampling on smooth
++ * surfaces (the area light is not part of the ray traced scene). */
++bool intersect_area_light(const LightRecord light,
++                          float3 origin,
++                          float3 direction,
++                          float3 &point,
++                          float &distance)
++{
++  const float3 light_normal = light.direction_power.xyz;
++  const float denom = dot(direction, light_normal);
++  if (denom >= -1e-5f) {
++    return false;
++  }
++  const float t = dot(light.position_type.xyz - origin, light_normal) / denom;
++  if (t <= 1e-4f) {
++    return false;
++  }
++  point = origin + direction * t;
++  const float3 rel = point - light.position_type.xyz;
++  const float u = dot(rel, light.area_right.xyz);
++  const float v = dot(rel, light.area_up.xyz);
++  const float2 half_size = float2(light.spot_flags.z, light.spot_flags.w) * 0.5f;
++  const uint shape = uint(light.area_right.w);
++  bool inside;
++  if (shape == 4u) {
++    inside = (u * u + v * v) <= half_size.x * half_size.x;
++  }
++  else if (shape == 5u) {
++    const float2 q = float2(u / max(half_size.x, 1e-5f), v / max(half_size.y, 1e-5f));
++    inside = dot(q, q) <= 1.0f;
++  }
++  else {
++    inside = abs(u) <= half_size.x && abs(v) <= half_size.y;
++  }
++  if (!inside) {
++    return false;
++  }
++  distance = t;
++  return true;
++}
++
++float area_light_area(const LightRecord light)
++{
++  const float2 half_size = float2(light.spot_flags.z, light.spot_flags.w) * 0.5f;
++  const uint shape = uint(light.area_right.w);
++  if (shape == 4u) {
++    return 3.14159265358979323846f * half_size.x * half_size.x;
++  }
++  if (shape == 5u) {
++    return 3.14159265358979323846f * half_size.x * half_size.y;
++  }
++  return 4.0f * half_size.x * half_size.y;
++}
++
++/* Approximation from "Ray Tracing Gems" chapter 32, identical to NRD's environment term. */
++float3 nrd_environment_term(float3 rf0, float no_v, float roughness)
++{
++  const float m = saturate(roughness * roughness);
++  const float4 x = float4(1.0f, no_v, no_v * no_v, no_v * no_v * no_v);
++  const float4 y = float4(1.0f, m, m * m, m * m * m);
++
++  const float bias_num = (0.99044f * x.x + 1.29678f * x.y) * y.x +
++                         (-1.28514f * x.x - 0.755907f * x.y) * y.y;
++  const float bias_den = (1.0f * x.x + 20.3225f * x.y + 121.563f * x.w) * y.x +
++                         (2.92338f * x.x - 27.0302f * x.y + 626.13f * x.w) * y.y +
++                         (59.4188f * x.x + 222.592f * x.y + 316.627f * x.w) * y.w;
++  const float scale_num = (0.0365463f * x.x + 9.0632f * x.y) * y.x +
++                          (3.32707f * x.x - 9.04756f * x.y) * y.y;
++  const float scale_den = (1.0f * x.x + 9.04401f * x.z + 5.56589f * x.w) * y.x +
++                          (3.59685f * x.x - 16.3174f * x.z + 19.7886f * x.w) * y.y +
++                          (-1.36772f * x.x + 9.22949f * x.z - 20.2123f * x.w) * y.w;
++
++  const float bias = bias_num / max(bias_den, 1e-6f);
++  const float scale = scale_num / max(scale_den, 1e-6f);
++  return saturate(rf0 * scale + bias);
++}
++
++/* Matches NRD's NRD_MaterialFactors: removes the primary surface BRDF from the denoiser
++ * input. The same factors are re-applied in the composite pass. */
++void nrd_material_factors(float3 n,
++                          float3 v,
++                          float3 albedo,
++                          float3 rf0,
++                          float roughness,
++                          float3 &diff_factor,
++                          float3 &spec_factor)
++{
++  const float3 f_env = nrd_environment_term(rf0, abs(dot(n, v)), roughness);
++  diff_factor = mix(float3(0.02f), float3(1.0f), (float3(1.0f) - f_env) * albedo);
++  spec_factor = f_env * mix(0.1f, 1.0f, roughness);
++  spec_factor = mix(float3(0.02f), float3(1.0f), spec_factor);
++}
++
++/* REBLUR works in YCoCg space. The denoiser input radiance must be converted on the way in and
++ * the denoised output must be converted back on the way out (NRD_Sample uses
++ * REBLUR_FrontEnd_PackRadianceAndNormHitDist and REBLUR_BackEnd_UnpackRadianceAndNormHitDist).
++ * Feeding linear RGB to REBLUR (as RELAX expects) silently shifts the hue, e.g. neutral grey
++ * surfaces turn pink. */
++float3 linear_to_ycocg(float3 color)
++{
++  const float y = dot(color, float3(0.25f, 0.5f, 0.25f));
++  const float co = dot(color, float3(0.5f, 0.0f, -0.5f));
++  const float cg = dot(color, float3(-0.25f, 0.5f, -0.25f));
++  return float3(y, co, cg);
++}
++
++float3 ycocg_to_linear(float3 color)
++{
++  const float t = color.x - color.z;
++  return max(float3(t + color.y, color.x + color.z, t - color.y), float3(0.0f));
++}
++
++/* Matches _REBLUR_GetHitDistanceNormalization with the default ReblurHitDistanceParameters
++ * (A = 3, B = 0.1, C = 20, D = -25). REBLUR expects the hit distance normalized to [0, 1] in
++ * the alpha channel of IN_DIFF_RADIANCE_HITDIST / IN_SPEC_RADIANCE_HITDIST. */
++float reblur_norm_hit_distance(float hit_distance, float view_z, float roughness)
++{
++  const float m = saturate(roughness * roughness);
++  const float scale = (3.0f + abs(view_z) * 0.1f) * mix(1.0f, 20.0f, saturate(exp2(-25.0f * m)));
++  return saturate(hit_distance / max(scale, 1e-4f));
++}
++
++/* NRD-Sample's EstimateDiffuseProbability: lobe selection probability from the approximate
++ * environment Fresnel term. This is what gives dielectric surfaces their specular reflections
++ * while keeping metals fully specular. */
++float estimate_diffuse_probability(float3 albedo, float3 rf0, float no_v, float roughness)
++{
++  const float3 f_env = nrd_environment_term(rf0, no_v, roughness);
++  const float lum_spec = dot(f_env, float3(0.2126f, 0.7152f, 0.0722f));
++  const float lum_diff = dot(albedo * (float3(1.0f) - f_env),
++                             float3(0.2126f, 0.7152f, 0.0722f));
++  if (lum_diff <= 1e-5f) {
++    return 0.0f;
++  }
++  if (lum_spec <= 1e-5f) {
++    return 1.0f;
++  }
++  return clamp(lum_diff / (lum_diff + lum_spec), 1.0f / 64.0f, 1.0f - 1.0f / 64.0f);
++}
++
++/* Transform a world-space hit into the object's previous world transform. */
++float3 to_previous_world(const InstanceRecord instance, float3 world_position)
++{
++  const float4 local = inverse(instance.object_to_world) * float4(world_position, 1.0f);
++  return (instance.prev_object_to_world * local).xyz;
++}
++
++bool previous_screen_uv(const PathTracingData data, float3 prev_world_position, float2 &uv)
++{
++  const float4 clip = data.prev_view_to_clip *
++                      (data.prev_world_to_view * float4(prev_world_position, 1.0f));
++  if (clip.w <= 1e-6f) {
++    return false;
++  }
++  uv = clip.xy / clip.w * 0.5f + 0.5f;
++  return uv.x >= 0.0f && uv.x < 1.0f && uv.y >= 0.0f && uv.y < 1.0f;
++}
++
++[[vertex]] void vert([[vertex_id]] const int vert_id, [[position]] float4 &out_pos)
++{
++  fullscreen_vertex(vert_id, out_pos);
++}
++
++[[fragment]] void frag([[frag_coord]] const float4 frag_co,
++                       [[resource_table]] Resources &srt,
++                       [[resource_table]] const draw::View &views,
++                       [[out]] PathtracingFragOut &frag_out)
++{
++  const float2 resolution = float2(srt.pathtracing_data.resolution);
++  /* The render view already contains the film's sub-pixel jitter. Adding the sample jitter here
++   * again would double-jitter the rays and desynchronize them from the motion vectors. */
++  const float2 screen_uv = frag_co.xy / resolution;
++
++  const ViewMatrices view = views.get(0);
++  const float3 near_point = view.point_screen_to_world(float3(screen_uv, 0.0f));
++  const float3 far_point = view.point_screen_to_world(float3(screen_uv, 1.0f));
++
++  Rng rng;
++  rng.state = hash_u32(uint(frag_co.x) + uint(frag_co.y) * uint(resolution.x) +
++                       srt.pathtracing_data.sample_index * 9781u);
++
++  float3 ray_origin = near_point;
++  float3 ray_direction = safe_normalize(far_point - near_point, float3(0.0f, 0.0f, -1.0f));
++
++  float3 radiance = float3(0.0f);
++  /* NRD splits the signal into diffuse and specular channels. Paths are classified by
++   * their first-bounce lobe (same approach as the NRD sample). */
++  float3 diff_radiance = float3(0.0f);
++  float3 spec_radiance = float3(0.0f);
++  /* Direct lighting at the primary surface. Kept out of the denoiser input (NRD sample
++   * composites it after denoising) so moving shadows cannot leave history trails. */
++  float3 direct_radiance = float3(0.0f);
++
++  float3 nrd_normal = float3(0.0f, 0.0f, 1.0f);
++  float nrd_material_id = 0.0f;
++  float nrd_roughness = 1.0f;
++  /* NRD expects raw view-space Z. Blender looks down -Z, so hits are negative.
++   * Sky is sign(viewZ) * INF (see NRD sample TraceOpaque.cs.hlsl). */
++  float nrd_viewz = uintBitsToFloat(0xFF800000u);
++  float diff_hitdist = 0.0f;
++  float spec_hitdist = 0.0f;
++  float3 primary_hit_position = float3(0.0f);
++  float3 primary_prev_hit_position = float3(0.0f);
++  bool primary_hit = false;
++  float3 diff_factor = float3(1.0f);
++  float3 spec_factor = float3(1.0f);
++
++  const float3 background = srt.pathtracing_data.background.rgb;
++  const float inv_pi = 0.3183098861837907f;
++
++  const uint max_bounces = max(srt.pathtracing_data.max_bounces, 1u);
++  const uint debug_flags = srt.pathtracing_data.pad0;
++
++  /* Trace both first-bounce lobes deterministically (like NRD-Sample's full-resolution
++   * mode). Picking one lobe at random leaves one NRD channel empty every frame and makes
++   * both diffuse and specular significantly noisier after denoising. */
++  for (uint lobe = 0u; lobe < 2u; lobe++) {
++    const bool primary_specular = (lobe == 1u);
++    bool path_is_specular = primary_specular;
++    float path_hitdist = 0.0f;
++    float3 throughput = float3(1.0f);
++
++    for (uint bounce = 0u; bounce < max_bounces; bounce++) {
++
++    /* --------------------------------------------------------
++     * 1. 涓诲皠绾块亶鍘?(淇锛氫娇鐢?None 鑾峰彇鏈€杩戜氦鐐?
++     * -------------------------------------------------------- */
++    rayQuery query;
++    rayQueryInitialize(
++        query, srt.scene_as, gpu_RayFlagsNone, 0xFFu, ray_origin, 1e-4f, ray_direction, 1e30f);
++    while (rayQueryProceed(query)) {
++    }
++
++    if (rayQueryGetIntersectionType(query, true) == gpu_RayQueryCommittedIntersectionNone) {
++      if (bounce == 1u) {
++        /* The first secondary ray escaped: the path length is effectively infinite. */
++        path_hitdist = 1.0e5f;
++      }
++      else {
++        /* Primary miss: the composite pass uses the raw signal for sky pixels. Only one
++         * of the two lobe paths must write it, otherwise the background is doubled. */
++        if (lobe != 0u) {
++          break;
++        }
++      }
++      float3 background_radiance = throughput * background;
++      const float background_clamp = (bounce > 0u) ? srt.pathtracing_data.clamp_indirect :
++                                                     srt.pathtracing_data.clamp_direct;
++      if (background_clamp > 0.0f) {
++        background_radiance = min(background_radiance, float3(background_clamp));
++      }
++      if (path_is_specular) {
++        spec_radiance += background_radiance;
++      }
++      else {
++        diff_radiance += background_radiance;
++      }
++      break;
++    }
++
++    /* --------------------------------------------------------
++     * 2. 鑾峰彇鍛戒腑鐗╀綋鍜屾潗璐?(淇锛氳秺鐣屾椂缁熶竴搴旂敤 Clamp)
++     * -------------------------------------------------------- */
++    const uint instance_id = rayQueryGetIntersectionInstanceCustomIndex(query, true);
++    const uint primitive_index = rayQueryGetIntersectionPrimitiveIndex(query, true);
++
++    if (instance_id >= srt.pathtracing_data.instance_count) {
++      if (path_is_specular) {
++        spec_radiance += throughput * background;
++      }
++      else {
++        diff_radiance += throughput * background;
++      }
++      break;
++    }
++
++    const InstanceRecord instance = srt.instance_buf[instance_id];
++    const uint primitive_id = instance.primitive_offset + primitive_index;
++
++    if (primitive_id >= srt.pathtracing_data.primitive_count) {
++      if (path_is_specular) {
++        spec_radiance += throughput * background;
++      }
++      else {
++        diff_radiance += throughput * background;
++      }
++      break;
++    }
++
++    const PrimitiveRecord primitive = srt.primitive_buf[primitive_id];
++
++    if (primitive.material_id >= srt.pathtracing_data.material_count) {
++      if (path_is_specular) {
++        spec_radiance += throughput * background;
++      }
++      else {
++        diff_radiance += throughput * background;
++      }
++      break;
++    }
++
++    const MaterialRecord material = srt.material_buf[primitive.material_id];
++
++    const float hit_distance = rayQueryGetIntersectionT(query, true);
++    const float3 hit_position = ray_origin + ray_direction * hit_distance;
++    /* NRD expects the hit distance of the first secondary hit, not the sum of all path
++     * segments. NRD-Sample's accumulatedHitDist stops accumulating once the path becomes
++     * diffuse-like, and the NRD README recommends the first-bounce hit distance as the
++     * baseline for both diffuse and specular. Summing every bounce saturates the normalized
++     * guide and makes REBLUR blur indirect radiance across the platform edge (red ring). */
++    if (bounce == 1u) {
++      path_hitdist = hit_distance;
++    }
++
++    /* --------------------------------------------------------
++     * 3. 娉曠嚎璁＄畻
++     * -------------------------------------------------------- */
++    const float3x3 object_matrix = float3x3(instance.object_to_world[0].xyz,
++                                            instance.object_to_world[1].xyz,
++                                            instance.object_to_world[2].xyz);
++    const float3x3 normal_matrix = transpose(inverse(object_matrix));
++
++    const float3 geometric_normal = safe_normalize(normal_matrix * primitive.normal.xyz,
++                                                   float3(0.0f, 0.0f, 1.0f));
++    const bool front_face = dot(geometric_normal, ray_direction) < 0.0f;
++
++    const float2 bary = rayQueryGetIntersectionBarycentrics(query, true);
++    const float3 bary3 = float3(1.0f - bary.x - bary.y, bary.x, bary.y);
++
++    const float3 n0 = normal_matrix * primitive.normal0.xyz;
++    const float3 n1 = normal_matrix * primitive.normal1.xyz;
++    const float3 n2 = normal_matrix * primitive.normal2.xyz;
++
++    float3 shading_normal = n0 * bary3.x + n1 * bary3.y + n2 * bary3.z;
++    shading_normal = safe_normalize(shading_normal, geometric_normal);
++
++    if (dot(shading_normal, geometric_normal) < 0.0f) {
++      shading_normal = -shading_normal;
++    }
++
++    const float3 normal = front_face ? shading_normal : -shading_normal;
++
++    // 鍔ㄦ€佽绠楀亸绉婚噺
++    const float normal_deviation = 1.0f - saturate(dot(shading_normal, geometric_normal));
++    const float ray_epsilon = 1e-4f + hit_distance * 1e-6f + normal_deviation * 1e-4f;
++    const float3 offset_normal = front_face ? geometric_normal : -geometric_normal;
++
++    /* --------------------------------------------------------
++     * 4. 鏉愯川鍙傛暟 (淇锛氬幓闄ゆ浠ｇ爜)
++     * -------------------------------------------------------- */
++    const float3 base_color = material.base_color.rgb;
++    const float roughness = clamp(material.params.x, 0.05f, 1.0f);
++    const float metallic = clamp(material.params.y, 0.0f, 1.0f);
++    const float ior = 1.5f;
++
++    /* Primary specular indirect is the noisiest path on smooth dielectrics, while its
++     * energy is only the Fresnel tail. The area light's specular reflection is handled
++     * by BSDF-sampled direct lighting below, so skip this path for dielectrics. */
++    if (bounce == 0u && primary_specular && metallic < 0.5f) {
++      break;
++    }
++
++    if (bounce == 0u) {
++      /* NRD requires world-space normals. */
++      nrd_normal = normal;
++      nrd_roughness = roughness;
++      nrd_material_id = metallic > 0.5f ? 1.0f : 0.0f;
++      nrd_viewz = view.point_world_to_view(hit_position).z;
++      primary_hit_position = hit_position;
++      primary_prev_hit_position = to_previous_world(instance, hit_position);
++      primary_hit = true;
++    }
++
++    const float3 diffuse_color = base_color * (1.0f - metallic);  /* No transmission yet. */
++    const float dielectric_f0 = pow((ior - 1.0f) / (ior + 1.0f), 2.0f);
++    const float3 f0 = float3(dielectric_f0) * (1.0f - metallic) + base_color * metallic;
++    const float alpha = roughness * roughness;
++    const float alpha2 = alpha * alpha;
++    const float3 wo = -ray_direction;
++    const float ndotv = max(dot(normal, wo), 1e-4f);
++
++    if (bounce == 0u) {
++      nrd_material_factors(normal, wo, diffuse_color, f0, roughness, diff_factor, spec_factor);
++    }
++
++    /* --------------------------------------------------------
++     * 5. Direct lighting with shadow rays.
++     * -------------------------------------------------------- */
++    if (bounce > 0u || lobe == 0u) {
++      /* Multiple primary samples are cheap and remove most of the direct-light noise on
++       * large area lights. Secondary bounces stay at one sample and are handled by NRD. */
++      const uint direct_samples = (bounce == 0u && (debug_flags & 2u) == 0u) ? 4u : 1u;
++      for (uint direct_sample = 0u; direct_sample < direct_samples; direct_sample++) {
++    for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
++      const LightRecord light = srt.light_buf[light_id];
++      const uint light_type = uint(light.position_type.w);
++      /* Smooth surfaces get the area light sampled in the BSDF lobe instead. Uniform
++       * area sampling is far too noisy on a narrow specular lobe. */
++      const bool use_bsdf_spec = bounce == 0u && (debug_flags & 4u) == 0u &&
++                                 roughness < 0.35f && light_type == 4u;
++
++      float3 light_position = light.position_type.xyz;
++      float3 wi;
++      float3 irradiance;
++      float shadow_distance;
++
++      if (light_type == 1u) {
++        wi = safe_normalize(-light.direction_power.xyz, float3(0.0f, 0.0f, 1.0f));
++        irradiance = light.color_radius.rgb * light.direction_power.w;
++        shadow_distance = 1e30f;
++      }
++      else if (light_type == 4u) {
++        /* Blender area light: sample the emitting rectangle/disk uniformly by area. Sampling a
++         * sphere around the light (as older code did) makes large lights extend through floors
++         * and walls, producing light leaks and halos around nearby geometry. */
++        const uint area_shape = uint(light.area_right.w);
++        const float2 half_size = float2(light.spot_flags.z, light.spot_flags.w) * 0.5f;
++        const float2 uv = float2(rng.next(), rng.next());
++        float2 local;
++        if (area_shape == 4u) {
++          const float radius = sqrt(uv.x) * half_size.x;
++          const float phi = 2.0f * 3.14159265358979323846f * uv.y;
++          local = float2(cos(phi), sin(phi)) * radius;
++        }
++        else if (area_shape == 5u) {
++          const float radius = sqrt(uv.x);
++          const float phi = 2.0f * 3.14159265358979323846f * uv.y;
++          local = float2(cos(phi) * half_size.x, sin(phi) * half_size.y) * radius;
++        }
++        else {
++          local = (uv * 2.0f - 1.0f) * half_size;
++        }
++
++        light_position += light.area_right.xyz * local.x + light.area_up.xyz * local.y;
++
++        const float3 to_light = light_position - hit_position;
++        const float distance_sq = dot(to_light, to_light);
++        const float distance = sqrt(distance_sq);
++        wi = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
++        /* One-sided emission: only the front side of the light contributes. */
++        const float cos_light = saturate(dot(-wi, light.direction_power.xyz));
++        if (cos_light <= 0.0f) {
++          continue;
++        }
++        /* Uniform area sampling turns radiance power / (area * pi) into this irradiance
++         * estimator (the area cancels against the sampling pdf). */
++        irradiance = light.color_radius.rgb * light.direction_power.w * cos_light /
++                     max(3.14159265358979323846f * distance_sq, 1e-3f);
++        shadow_distance = distance;
++      }
++      else {
++        /* Point/spot lights: use the center. Sampling the radius as a full sphere puts half of
++         * the samples behind an occluder and leaks light around it. */
++        const float3 to_light = light.position_type.xyz - hit_position;
++        const float distance_sq = dot(to_light, to_light);
++        const float distance = sqrt(distance_sq);
++        wi = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
++
++        irradiance = light.color_radius.rgb * light.direction_power.w /
++                     max(4.0f * 3.14159265358979323846f * distance_sq, 1e-3f);
++        shadow_distance = distance;
++
++        if (light_type == 2u) {
++          const float cos_angle = dot(-wi, light.direction_power.xyz);
++          const float outer_angle = light.spot_flags.x * 0.5f;
++          const float inner_angle = outer_angle * (1.0f - light.spot_flags.y);
++          const float cos_outer = cos(outer_angle);
++          const float cos_inner = cos(inner_angle);
++          if (cos_angle < cos_outer) {
++            continue;
++          }
++          const float spot = saturate((cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-5f));
++          irradiance *= spot;
++        }
++      }
++
++      const float ndotl = max(dot(normal, wi), 0.0f);
++      if (ndotl <= 0.0f || shadow_distance <= ray_epsilon) {
++        continue;
++      }
++
++      rayQuery shadow_query;
++      // minT 璁句负 0锛屼緷闈犺捣鐐瑰亸绉婚槻鑷氦
++      rayQueryInitialize(shadow_query,
++                         srt.scene_as,
++                         gpu_RayFlagsTerminateOnFirstHit,
++                         0xFFu,
++                         hit_position + offset_normal * ray_epsilon,
++                         ray_epsilon,
++                         wi,
++                          max(shadow_distance - ray_epsilon, 0.0f));
++      while (rayQueryProceed(shadow_query)) {
++      }
++
++      // 淇锛氬彧鍒ゆ柇璺濈锛屼笉鍒ゆ柇 FrontFace锛堥槻姝㈠崟闈㈡紡鍏夛級
++      if (rayQueryGetIntersectionType(shadow_query, true) != gpu_RayQueryCommittedIntersectionNone)
++      {
++        continue;
++      }
++
++      const float3 h_vec = wi + wo;
++      const float3 half_vector = (dot(h_vec, h_vec) > 1e-8f) ? safe_normalize(h_vec, normal) :
++                                                               normal;
++
++      const float ndoth = saturate(dot(normal, half_vector));
++      const float vdoth = saturate(dot(wo, half_vector));
++      const float3 fresnel = fresnel_schlick(f0, vdoth);
++      const float distribution = ggx_distribution(ndoth, alpha2);
++      const float geometry = smith_g1(ndotv, alpha2) * smith_g1(ndotl, alpha2);
++
++      const float3 specular = (distribution * geometry) * fresnel /
++                              max(4.0f * ndotl * ndotv, 1e-4f);
++
++      // 鑳介噺琛ュ伩锛氱洿鎺ュ厜鍑忓幓 Fresnel 鑳介噺锛岄槻姝㈣繃鏇?
++      float3 direct_diffuse = irradiance * ndotl * diffuse_color * inv_pi * (1.0f - fresnel);
++      float3 direct_specular = irradiance * ndotl * specular;
++      if (use_bsdf_spec) {
++        direct_specular = float3(0.0f);
++      }
++      const float direct_clamp = (bounce > 0u) ? srt.pathtracing_data.clamp_indirect :
++                                                 srt.pathtracing_data.clamp_direct;
++      if (direct_clamp > 0.0f) {
++        direct_diffuse = min(direct_diffuse, float3(direct_clamp));
++        direct_specular = min(direct_specular, float3(direct_clamp));
++      }
++
++      const float3 direct_contribution =
++          throughput * (direct_diffuse + direct_specular) / float(direct_samples);
++      if (bounce == 0u) {
++        direct_radiance += direct_contribution;
++      }
++      else if (path_is_specular) {
++        spec_radiance += direct_contribution;
++      }
++      else {
++        diff_radiance += direct_contribution;
++      }
++    }
++      }
++    }
++
++    /* BSDF-sampled direct specular for smooth surfaces and area lights. The reflected ray
++     * is intersected analytically with the light plane, then shadowed against the scene.
++     * This is the low-variance counterpart of uniform area sampling used above. */
++    if (bounce == 0u && lobe == 0u && (debug_flags & 4u) == 0u && roughness < 0.35f) {
++      const uint bsdf_samples = 4u;
++      for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
++        const LightRecord light = srt.light_buf[light_id];
++        if (uint(light.position_type.w) != 4u) {
++          continue;
++        }
++        const float area = area_light_area(light);
++        if (area <= 1e-6f) {
++          continue;
++        }
++        const float3 radiance_light = light.color_radius.rgb * light.direction_power.w /
++                                      (area * 3.14159265358979323846f);
++        for (uint bsdf_sample = 0u; bsdf_sample < bsdf_samples; bsdf_sample++) {
++          const float3 half_vector = sample_ggx_half_vector(
++              rng.next(), rng.next(), normal, alpha2);
++          const float3 wi_bsdf = reflect(ray_direction, half_vector);
++          const float ndotl = dot(normal, wi_bsdf);
++          if (ndotl <= 0.0f) {
++            continue;
++          }
++          const float ndoth = saturate(dot(normal, half_vector));
++          const float vdoth = saturate(dot(wo, half_vector));
++          if (ndoth <= 1e-4f || vdoth <= 0.0f) {
++            continue;
++          }
++          float3 light_point;
++          float light_distance;
++          if (!intersect_area_light(light, hit_position, wi_bsdf, light_point, light_distance)) {
++            continue;
++          }
++          if (dot(-wi_bsdf, light.direction_power.xyz) <= 0.0f) {
++            continue;
++          }
++          rayQuery shadow_query;
++          rayQueryInitialize(shadow_query,
++                             srt.scene_as,
++                             gpu_RayFlagsTerminateOnFirstHit,
++                             0xFFu,
++                             hit_position + offset_normal * ray_epsilon,
++                             ray_epsilon,
++                             wi_bsdf,
++                             max(light_distance - ray_epsilon, 0.0f));
++          while (rayQueryProceed(shadow_query)) {
++          }
++          if (rayQueryGetIntersectionType(shadow_query, true) !=
++              gpu_RayQueryCommittedIntersectionNone) {
++            continue;
++          }
++          const float3 fresnel = fresnel_schlick(f0, vdoth);
++          const float geometry = smith_g1(ndotv, alpha2) * smith_g1(ndotl, alpha2);
++          const float3 specular_weight = geometry * fresnel * vdoth /
++                                         max(ndotv * ndoth, 1e-4f);
++          float3 contribution = throughput * specular_weight * radiance_light;
++          const float direct_clamp = srt.pathtracing_data.clamp_direct;
++          if (direct_clamp > 0.0f) {
++            contribution = min(contribution, float3(direct_clamp));
++          }
++          direct_radiance += contribution / float(bsdf_samples);
++        }
++      }
++    }
++
++    /* --------------------------------------------------------
++     * 6. Indirect lighting. The lobe is picked with the same Fresnel-weighted probability as the
++     * NRD sample, so dielectrics keep their specular reflection instead of being pure Lambert.
++     * -------------------------------------------------------- */
++    float3 wi;
++    float3 brdf_weight;
++
++    const float diffuse_probability = estimate_diffuse_probability(
++        diffuse_color, f0, ndotv, roughness);
++    bool sample_specular;
++    if (bounce == 0u) {
++      /* Primary: both lobes are traced deterministically, so no lobe-selection noise. */
++      sample_specular = primary_specular;
++      path_is_specular = primary_specular;
++    }
++    else {
++      sample_specular = rng.next() >= diffuse_probability;
++    }
++
++    if (sample_specular) {
++      const float3 half_vector = sample_ggx_half_vector(rng.next(), rng.next(), normal, alpha2);
++      wi = reflect(ray_direction, half_vector);
++      const float ndotl = dot(normal, wi);
++      if (ndotl <= 0.0f) {
++        break;
++      }
++
++      const float ndoth = saturate(dot(normal, half_vector));
++      const float vdoth = saturate(dot(wo, half_vector));
++      const float3 fresnel = fresnel_schlick(f0, vdoth);
++      const float geometry = smith_g1(ndotv, alpha2) * smith_g1(ndotl, alpha2);
++
++      /* Standard GGX NDF-sampling weight. At the primary hit both lobes are traced, so
++       * there is no lobe-selection probability to divide by. */
++      brdf_weight = geometry * fresnel * vdoth / max(ndotv * ndoth, 1e-4f);
++      if (bounce > 0u) {
++        brdf_weight /= max(1.0f - diffuse_probability, 1e-3f);
++      }
++    }
++    else {
++      wi = sample_cosine_hemisphere(rng.next(), rng.next(), normal);
++      /* Cosine sampling cancels the cosine and pi of the Lambert BRDF. */
++      brdf_weight = diffuse_color;
++      if (bounce > 0u) {
++        brdf_weight /= max(diffuse_probability, 1e-3f);
++      }
++    }
++
++    // 闄愬埗涓婇檺闃叉鐖嗙偢
++    throughput = min(throughput * brdf_weight, float3(100.0f));
++
++    if (max_component(throughput) <= 0.0f) {
++      break;
++    }
++
++    ray_origin = hit_position + offset_normal * ray_epsilon;
++    ray_direction = safe_normalize(wi, normal);
++    }
++
++    if (primary_specular) {
++      spec_hitdist = path_hitdist;
++    }
++    else {
++      diff_hitdist = path_hitdist;
++    }
++  }
++
++  diff_radiance = max(diff_radiance, float3(0.0f));
++  spec_radiance = max(spec_radiance, float3(0.0f));
++  diff_radiance = min(diff_radiance, float3(1000.0f));
++  spec_radiance = min(spec_radiance, float3(1000.0f));
++  radiance = diff_radiance + spec_radiance;
++  /* EEVEE combined alpha stores transmittance (film converts with 1-alpha), so 0 = opaque. */
++  frag_out.color = float4(radiance + direct_radiance, 0.0f);
++
++  const int2 nrd_texel = int2(frag_co.xy);
++  imageStore(srt.out_normal_roughness_img,
++             nrd_texel,
++             pack_normal_roughness(nrd_normal, nrd_roughness, nrd_material_id));
++  imageStore(srt.out_viewz_img, nrd_texel, float4(nrd_viewz));
++  /* Demodulate so the denoiser works on irradiance (NRD requirement). Factors are stored in
++   * separate targets and re-applied in the composite pass. REBLUR additionally expects YCoCg
++   * encoded radiance and a normalized hit distance in alpha. Both first-bounce lobes are
++   * traced, so both channels carry their own hit distance. */
++  const float diff_hit_distance = reblur_norm_hit_distance(diff_hitdist, nrd_viewz, 1.0f);
++  const float spec_hit_distance = reblur_norm_hit_distance(spec_hitdist, nrd_viewz, nrd_roughness);
++  imageStore(srt.out_diffuse_img,
++             nrd_texel,
++             float4(linear_to_ycocg(diff_radiance / diff_factor), diff_hit_distance));
++  imageStore(srt.out_specular_img,
++             nrd_texel,
++             float4(linear_to_ycocg(spec_radiance / spec_factor), spec_hit_distance));
++  imageStore(srt.out_diff_factor_img, nrd_texel, float4(diff_factor, 1.0f));
++  imageStore(srt.out_spec_factor_img, nrd_texel, float4(spec_factor, 1.0f));
++  imageStore(srt.out_direct_img, nrd_texel, float4(direct_radiance, nrd_viewz));
++  float2 nrd_motion = float2(0.0f);
++  float nrd_motion_z = 0.0f;
++  if (primary_hit) {
++    float2 prev_uv;
++    if (previous_screen_uv(srt.pathtracing_data, primary_prev_hit_position, prev_uv)) {
++      const float2 resolution_f = float2(srt.pathtracing_data.resolution);
++      /* frag_co is already at the pixel center: no extra half-pixel offset here. */
++      const float2 curr_uv = float2(float(frag_co.x), float(frag_co.y)) / resolution_f;
++      /* NRD requires non-jittered motion vectors (NRD-Sample projects the hit point with the
++       * unjittered matrices). The current hit comes from the jittered ray, so its unjittered
++       * position is `curr_uv - curr_jitter`; `prev_view_to_clip` adds `prev_jitter`. Removing
++       * `prev_jitter - curr_jitter` leaves zero motion for a static camera. */
++      prev_uv -= (srt.pathtracing_data.prev_jitter - srt.pathtracing_data.curr_jitter) /
++                 resolution_f;
++      nrd_motion = (prev_uv - curr_uv) * resolution_f;
++      /* NRD's recommended 2.5D motion stores the view-Z change in z. This is what lets REBLUR
++       * detect disocclusion during camera dolly/zoom instead of keeping a scaled ghost. */
++      const float prev_viewz = (srt.pathtracing_data.prev_world_to_view *
++                                float4(primary_prev_hit_position, 1.0f))
++                                   .z;
++      nrd_motion_z = prev_viewz - nrd_viewz;
++    }
++  }
++  if ((debug_flags & 8u) != 0u) {
++    nrd_motion = float2(0.0f);
++    nrd_motion_z = 0.0f;
++  }
++  imageStore(srt.out_motion_img, nrd_texel, float4(nrd_motion, nrd_motion_z, 0.0f));
++}
++
++PipelineGraphic debug(vert, frag);
++
++}  // namespace eevee::pathtracing
++
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_taa.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_taa.bsl.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e8a0240777bbbd40f22d4f22daa8284c0f1d88c
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_taa.bsl.hh
+@@ -0,0 +1,149 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Final temporal accumulation for the path tracing pipeline.
++ *
++ * Mirrors the NRD-Sample TAA stage: the composed image is accumulated with a
++ * reprojected history using a neighborhood color clamp. Keeping this pass after
++ * Composition is important because RELAX only denoises the indirect signal; the
++ * direct term and the material remodulation still carry per-frame noise.
++ */
++
++#pragma once
++
++#include "eevee_pathtracing_shared.hh"
++#include "gpu_shader_fullscreen.bsl.hh"
++
++namespace eevee::pathtracing {
++
++struct TaaResources {
++  [[uniform(1)]] const PathTracingData &pathtracing_data;
++  /* Composed radiance written by the composite pass (RGB). */
++  [[image(0, read, SFLOAT_16_16_16_16)]] const image2D in_composed_img;
++  /* Non-jittered pixel motion (previous - current). */
++  [[image(1, read, SFLOAT_16_16_16_16)]] const image2D in_motion_img;
++  /* Previous TAA result. A is the previous current-frame weight. */
++  [[image(2, read, SFLOAT_16_16_16_16)]] const image2D in_history_img;
++  /* New TAA result for the next frame. A is the current-frame weight. */
++  [[image(3, write, SFLOAT_16_16_16_16)]] image2D out_history_img;
++  /* Linear view-space Z, used to pick the closest surface in the neighborhood for
++   * reprojection (NRD-Sample Taa.cs does the same through the motion texture). */
++  [[image(4, read, SFLOAT_32)]] const image2D in_viewz_img;
++  /* Debug path: output the reprojection motion instead of the accumulated color. */
++  [[push_constant]] const float debug_motion;
++};
++
++struct TaaFragOut {
++  [[frag_color(0)]] float4 color;
++};
++
++[[vertex]] void taa_vert([[vertex_id]] const int vert_id, [[position]] float4 &out_pos)
++{
++  fullscreen_vertex(vert_id, out_pos);
++}
++
++[[fragment]] void taa_frag([[frag_coord]] const float4 frag_co,
++                           [[resource_table]] TaaResources &srt,
++                           [[out]] TaaFragOut &frag_out)
++{
++  const int2 resolution = int2(srt.pathtracing_data.resolution);
++  const int2 texel = int2(frag_co.xy);
++  const int2 max_texel = resolution - int2(1);
++  const float3 current = imageLoad(srt.in_composed_img, texel).rgb;
++  const float current_viewz = abs(imageLoad(srt.in_viewz_img, texel).r);
++
++  if (srt.debug_motion > 0.5f) {
++    /* Motion in pixels, signed: 0.5 is zero, 0/1 are -/+ 50 px. */
++    const float2 debug = imageLoad(srt.in_motion_img, texel).xy * 0.01f + 0.5f;
++    frag_out.color = float4(debug, 0.0f, 0.0f);
++    return;
++  }
++
++  /* NRD-Sample uses a 5x5 neighborhood for thin/noisy surfaces (and sky). It also
++   * picks the closest neighborhood pixel's motion vector, which prevents a silhouette
++   * pixel from reprojecting the background history onto the foreground. */
++  float3 mean = float3(0.0f);
++  float3 second_moment = float3(0.0f);
++  float weight_sum = 0.0f;
++  float closest_viewz = current_viewz;
++  int2 closest_offset = int2(0, 0);
++  for (int dy = -2; dy <= 2; dy++) {
++    for (int dx = -2; dx <= 2; dx++) {
++      const int2 offset = int2(dx, dy);
++      const int2 p = clamp(texel + offset, int2(0), max_texel);
++      const float3 c = imageLoad(srt.in_composed_img, p).rgb;
++      const float viewz = abs(imageLoad(srt.in_viewz_img, p).r);
++      if (viewz < closest_viewz) {
++        closest_viewz = viewz;
++        closest_offset = offset;
++      }
++      const float2 normalized_offset = float2(offset) * 0.5f;
++      const float w = exp(-dot(normalized_offset, normalized_offset));
++      mean += c * w;
++      second_moment += c * c * w;
++      weight_sum += w;
++    }
++  }
++  mean /= weight_sum;
++  second_moment /= weight_sum;
++  float3 variance = second_moment - mean * mean;
++  variance.x = max(variance.x, 0.0f);
++  variance.y = max(variance.y, 0.0f);
++  variance.z = max(variance.z, 0.0f);
++  const float3 sigma = sqrt(variance) * 2.0f;
++
++  /* Reproject the history. MV is stored in pixels, previous - current. */
++  const float2 motion = imageLoad(
++                           srt.in_motion_img,
++                           clamp(texel + closest_offset, int2(0), max_texel))
++                           .xy;
++  /* `texel` is an integer index; its center is at texel + 0.5 in pixel coordinates. */
++  const float2 prev_pixel = float2(texel) + 0.5f + motion;
++  const bool in_screen = prev_pixel.x >= 0.0f && prev_pixel.y >= 0.0f &&
++                         prev_pixel.x < float(resolution.x) &&
++                         prev_pixel.y < float(resolution.y);
++
++  /* Bilinear history lookup with clamped coordinates. */
++  const float2 sample_pos = prev_pixel - 0.5f;
++  const int2 base = int2(floor(sample_pos));
++  const float2 frac = sample_pos - float2(base);
++  const float4 h00 = imageLoad(srt.in_history_img, clamp(base, int2(0), max_texel));
++  const float4 h10 = imageLoad(srt.in_history_img, clamp(base + int2(1, 0), int2(0), max_texel));
++  const float4 h01 = imageLoad(srt.in_history_img, clamp(base + int2(0, 1), int2(0), max_texel));
++  const float4 h11 = imageLoad(srt.in_history_img, clamp(base + int2(1, 1), int2(0), max_texel));
++  const float4 history = mix(mix(h00, h10, frac.x), mix(h01, h11, frac.x), frac.y);
++
++  /* Clamp history to the local color distribution to reject stale samples. */
++  float3 clamped_history;
++  clamped_history.x = clamp(history.x, mean.x - sigma.x, mean.x + sigma.x);
++  clamped_history.y = clamp(history.y, mean.y - sigma.y, mean.y + sigma.y);
++  clamped_history.z = clamp(history.z, mean.z - sigma.z, mean.z + sigma.z);
++
++  const bool history_valid = (srt.pathtracing_data.taa_history_valid != 0u) && in_screen &&
++                             (history.w > 0.0f);
++
++  float mix_rate = clamp(history.w, 0.0f, 1.0f);
++  mix_rate /= (1.0f + mix_rate);
++  /* Reject history that disagrees with the current neighborhood. This is the cheap
++   * linear-space equivalent of NRD-Sample's CIELAB JND test and is what stops dark
++   * silhouettes from slowly diffusing into the foreground. */
++  const float3 luma_weights = float3(0.2126f, 0.7152f, 0.0722f);
++  const float history_luma = max(1.0e-4f, dot(history.rgb, luma_weights));
++  const float3 history_error = abs(clamped_history - history.rgb);
++  mix_rate = saturate(mix_rate + dot(history_error, luma_weights) / history_luma);
++  /* Match NRD-Sample's minimum current-frame weight: gTAA = 1 / (1 + 15.5). */
++  const float current_weight = history_valid ? max(mix_rate, 0.0606f) : 1.0f;
++  const float3 result = mix(clamped_history, current, current_weight);
++
++  imageStore(srt.out_history_img, texel, float4(result, history_valid ? mix_rate : 1.0f));
++  /* EEVEE combined alpha stores transmittance (film converts with 1-alpha), so 0 = opaque. */
++  frag_out.color = float4(result, 0.0f);
++}
++
++PipelineGraphic taa(taa_vert, taa_frag);
++
++}  // namespace eevee::pathtracing
+diff --git a/source/blender/gpu/CMakeLists.txt b/source/blender/gpu/CMakeLists.txt
+index e66e5c443dc0fe8c92ef751ef792d1cde0d36f11..a34da4da29668451c910206cca962a5d0c62004d 100644
+--- a/source/blender/gpu/CMakeLists.txt
++++ b/source/blender/gpu/CMakeLists.txt
+@@ -298,6 +298,7 @@ set(VULKAN_SRC
+   vulkan/vk_index_buffer.cc
+   vulkan/vk_memory_layout.cc
+   vulkan/vk_memory_pool.cc
++  vulkan/vk_nrd.cc
+   vulkan/vk_pipeline_pool.cc
+   vulkan/vk_pixel_buffer.cc
+   vulkan/vk_push_constants.cc
+@@ -909,6 +910,25 @@ endif()
+ 
+ blender_add_lib(bf_gpu "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+ add_library(bf::gpu ALIAS bf_gpu)
++
++if(WIN32)
++  set(NRD_SAMPLE_ROOT "" CACHE PATH "Path to the NRD-Sample 4.17.1 root directory")
++  if(NOT NRD_SAMPLE_ROOT)
++    message(FATAL_ERROR
++      "NRD_SAMPLE_ROOT is not set. Configure with "
++      "-DNRD_SAMPLE_ROOT=<path-to-NRD-Sample-4.17.1>."
++    )
++  endif()
++  target_include_directories(bf_gpu PRIVATE
++    "${NRD_SAMPLE_ROOT}/External/NRD/Include"
++    "${NRD_SAMPLE_ROOT}/External/NRD/Integration"
++    "${NRD_SAMPLE_ROOT}/External/NRIFramework/External/NRI/Include"
++  )
++  target_link_libraries(bf_gpu PUBLIC
++    "${NRD_SAMPLE_ROOT}/_Bin/Release/NRD.lib"
++    "${NRD_SAMPLE_ROOT}/_Bin/Release/NRI.lib"
++  )
++endif()
+ target_link_libraries(bf_gpu PUBLIC
+   bf_compositor_shaders
+   bf_draw_shaders
+diff --git a/source/blender/gpu/GPU_nrd.hh b/source/blender/gpu/GPU_nrd.hh
+new file mode 100644
+index 0000000000000000000000000000000000000000..1eeb955a4e21793ec43dfdd6fb90284ed8876ee1
+--- /dev/null
++++ b/source/blender/gpu/GPU_nrd.hh
+@@ -0,0 +1,39 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup gpu
++ *
++ * Optional NVIDIA NRD denoiser bridge for the Vulkan backend.
++ */
++
++#pragma once
++
++#include "GPU_texture.hh"
++
++namespace blender::gpu {
++
++struct NrdDenoiseInput {
++  Texture *color = nullptr;
++  Texture *specular = nullptr;
++  Texture *normal_roughness = nullptr;
++  Texture *viewz = nullptr;
++  Texture *motion = nullptr;
++  Texture *output = nullptr;
++  Texture *output_specular = nullptr;
++  int width = 0;
++  int height = 0;
++  float view_z_scale = 1.0f;
++  float denoising_range = 1e6f;
++  /* Camera jitter in pixels, in [-0.5, 0.5], as expected by NRD. */
++  float camera_jitter[2] = {0.0f, 0.0f};
++  float camera_jitter_prev[2] = {0.0f, 0.0f};
++  bool reset_history = false;
++  const float *view_to_clip = nullptr;
++  const float *world_to_view = nullptr;
++};
++
++bool nrd_denoise(const NrdDenoiseInput &input);
++
++}  // namespace blender::gpu
+diff --git a/source/blender/gpu/GPU_ray_tracing.hh b/source/blender/gpu/GPU_ray_tracing.hh
+index a2e7d8bbcf0f6d85f531a6bde42d8428bfe7f4e9..f673b98fe08dab340847601f4df4cd9277f0247c 100644
+--- a/source/blender/gpu/GPU_ray_tracing.hh
++++ b/source/blender/gpu/GPU_ray_tracing.hh
+@@ -22,6 +22,13 @@ struct InstanceID {
+   int64_t id;
+ };
+ 
++struct InstanceInfo {
++  /** Value exposed to shaders as instanceCustomIndex / Metal userID. Limited to 24 bits. */
++  uint32_t custom_index = 0;
++  /** Ray visibility mask. */
++  uint8_t mask = 0xFF;
++};
++
+ /**
+  * Acceleration structure for an array of instances.
+  */
+@@ -42,10 +49,10 @@ class TopLevelAS {
+ 
+   virtual InstanceID add_instance(const BottomLevelAS &blas,
+                                   const float4x4 &mat,
+-                                  uint8_t mask = 0xFF) = 0;
++                                  const InstanceInfo &info = {}) = 0;
+   virtual void update_instance(InstanceID instance_id,
+                                const float4x4 &mat,
+-                               uint8_t mask = 0xFF) = 0;
++                               const InstanceInfo &info = {}) = 0;
+   virtual void build() = 0;
+   virtual void bind(int slot) = 0;
+ };
+diff --git a/source/blender/gpu/metal/mtl_ray_tracing.hh b/source/blender/gpu/metal/mtl_ray_tracing.hh
+index dfb417e5c04b0ea63e99c19708ee4273ce7426d4..65e9eb0a1959b626ca197b97a4b2b6b488483f4d 100644
+--- a/source/blender/gpu/metal/mtl_ray_tracing.hh
++++ b/source/blender/gpu/metal/mtl_ray_tracing.hh
+@@ -44,7 +44,7 @@ class MTLTopLevelAS : public TopLevelAS {
+   struct Instance {
+     float4x4 transform;
+     const MTLBottomLevelAS *blas;
+-    uint8_t mask;
++    InstanceInfo info;
+   };
+ 
+   id<MTLAccelerationStructure> acceleration_structure_ = nil;
+@@ -57,8 +57,12 @@ class MTLTopLevelAS : public TopLevelAS {
+   MTLTopLevelAS(const char *name);
+   ~MTLTopLevelAS() override;
+ 
+-  InstanceID add_instance(const BottomLevelAS &blas, const float4x4 &mat, uint8_t mask) override;
+-  void update_instance(InstanceID instance_id, const float4x4 &mat, uint8_t mask) override;
++  InstanceID add_instance(const BottomLevelAS &blas,
++                          const float4x4 &mat,
++                          const InstanceInfo &info) override;
++  void update_instance(InstanceID instance_id,
++                       const float4x4 &mat,
++                       const InstanceInfo &info) override;
+   void build() override;
+   void bind(int slot) override;
+ 
+diff --git a/source/blender/gpu/metal/mtl_ray_tracing.mm b/source/blender/gpu/metal/mtl_ray_tracing.mm
+index 05f2259c2804734bd4fe71e28d838ca7d962959e..db6b7b8101c6f6e3c76d3e368e196ec04e3a4649 100644
+--- a/source/blender/gpu/metal/mtl_ray_tracing.mm
++++ b/source/blender/gpu/metal/mtl_ray_tracing.mm
+@@ -154,22 +154,26 @@ MTLTopLevelAS::~MTLTopLevelAS()
+ 
+ InstanceID MTLTopLevelAS::add_instance(const BottomLevelAS &blas,
+                                        const float4x4 &mat,
+-                                       uint8_t mask)
++                                       const InstanceInfo &info)
+ {
++  BLI_assert(info.custom_index < (1u << 24));
+   InstanceID id = {int64_t(instances_.size())};
+-  instances_.append({mat, static_cast<const MTLBottomLevelAS *>(&blas), mask});
++  instances_.append({mat, static_cast<const MTLBottomLevelAS *>(&blas), info});
+   is_dirty_ = true;
+   needs_rebuild_ = true;
+   return id;
+ }
+ 
+-void MTLTopLevelAS::update_instance(InstanceID instance_id, const float4x4 &mat, uint8_t mask)
++void MTLTopLevelAS::update_instance(InstanceID instance_id,
++                                    const float4x4 &mat,
++                                    const InstanceInfo &info)
+ {
+   if (instance_id.id < 0 || instance_id.id >= instances_.size()) {
+     return;
+   }
++  BLI_assert(info.custom_index < (1u << 24));
+   instances_[instance_id.id].transform = mat;
+-  instances_[instance_id.id].mask = mask;
++  instances_[instance_id.id].info = info;
+   is_dirty_ = true;
+ }
+ 
+@@ -219,11 +223,10 @@ void MTLTopLevelAS::build()
+       id<MTLAccelerationStructure> blas = inst.blas->acceleration_structure();
+       descs[i].transformationMatrix = pack_transform(inst.transform);
+       descs[i].options = MTLAccelerationStructureInstanceOptionOpaque;
+-      descs[i].mask = (blas != nil) ? inst.mask : 0;
++      descs[i].mask = (blas != nil) ? inst.info.mask : 0;
+       descs[i].intersectionFunctionTableOffset = 0;
+       descs[i].accelerationStructureIndex = uint32_t(i);
+-      /* Per-instance custom index; hardcoded 0 to match Vulkan until add_instance exposes it. */
+-      descs[i].userID = 0;
++      descs[i].userID = inst.info.custom_index & 0xFFFFFFu;
+       [blas_array addObject:(blas != nil) ? blas : fallback_blas];
+     }
+     desc.instanceCount = descs_count;
+diff --git a/source/blender/gpu/tests/ray_tracing_test.cc b/source/blender/gpu/tests/ray_tracing_test.cc
+index 7d8cea43d07dcd2c38f5f04f2aa23228d5bbb37d..f6a6a04527829f6e0adc0532c49bb694e722d34e 100644
+--- a/source/blender/gpu/tests/ray_tracing_test.cc
++++ b/source/blender/gpu/tests/ray_tracing_test.cc
+@@ -196,12 +196,12 @@ static void test_ray_tracing_instance_mask()
+   float4x4 mat_y_pos = math::from_location<float4x4>(float3(0.0f, 2.0f, 0.0f));
+   float4x4 mat_z_neg = math::from_location<float4x4>(float3(0.0f, 0.0f, -2.0f));
+   float4x4 mat_z_pos = math::from_location<float4x4>(float3(0.0f, 0.0f, 2.0f));
+-  tlas->add_instance(*blas, mat_x_neg, 0x01);
+-  tlas->add_instance(*blas, mat_x_pos, 0x02);
+-  tlas->add_instance(*blas, mat_y_neg, 0x04);
+-  tlas->add_instance(*blas, mat_y_pos, 0x08);
+-  tlas->add_instance(*blas, mat_z_neg, 0x10);
+-  tlas->add_instance(*blas, mat_z_pos, 0x20);
++  tlas->add_instance(*blas, mat_x_neg, {0, 0x01});
++  tlas->add_instance(*blas, mat_x_pos, {0, 0x02});
++  tlas->add_instance(*blas, mat_y_neg, {0, 0x04});
++  tlas->add_instance(*blas, mat_y_pos, {0, 0x08});
++  tlas->add_instance(*blas, mat_z_neg, {0, 0x10});
++  tlas->add_instance(*blas, mat_z_pos, {0, 0x20});
+   tlas->build();
+ 
+   Vector<Ray> rays;
+@@ -452,7 +452,7 @@ static void test_ray_tracing_fragment()
+ }
+ GPU_TEST(ray_tracing_fragment)
+ 
+-/* Verify the per-instance custom index (Metal userID) is readable and 0 for a default instance. */
++/* Verify the per-instance custom index (Metal userID) is readable. */
+ static void test_ray_tracing_instance_custom_index()
+ {
+   SUPPORTS_RAY_QUERY()
+@@ -465,7 +465,8 @@ static void test_ray_tracing_instance_custom_index()
+   blas->build();
+ 
+   TopLevelASPtr tlas(GPU_ray_tracing_tlas_alloc(__func__));
+-  tlas->add_instance(*blas, float4x4::identity());
++  const uint32_t custom_index = 42;
++  tlas->add_instance(*blas, float4x4::identity(), {custom_index, 0xFF});
+   tlas->build();
+ 
+   /* All rays start at the cube center and hit it. */
+@@ -514,8 +515,8 @@ static void test_ray_tracing_instance_custom_index()
+   GPU_storagebuf_free(custom_index_buf);
+   GPU_shader_free(shader);
+ 
+-  /* Each hit returns the instance userID, hardcoded to 0. */
+-  Array<uint32_t> expected(ray_count, 0);
++  /* Each hit returns the instance userID. */
++  Array<uint32_t> expected(ray_count, custom_index);
+   EXPECT_EQ_SPAN(expected.as_span(), result.as_span());
+ }
+ GPU_TEST(ray_tracing_instance_custom_index)
+diff --git a/source/blender/gpu/vulkan/vk_device.hh b/source/blender/gpu/vulkan/vk_device.hh
+index 733276c80dc63d0414ef116934ed7b8049e126e5..2a14ea5648b08c7cdae2e35040e1f97f300a76ac 100644
+--- a/source/blender/gpu/vulkan/vk_device.hh
++++ b/source/blender/gpu/vulkan/vk_device.hh
+@@ -340,6 +340,11 @@ class VKDevice : public NonCopyable {
+     return vk_queue_family_;
+   }
+ 
++  VkQueue queue_get() const
++  {
++    return vk_queue_;
++  }
++
+   inline VmaAllocator mem_allocator_get() const
+   {
+     return mem_allocator_;
+diff --git a/source/blender/gpu/vulkan/vk_nrd.cc b/source/blender/gpu/vulkan/vk_nrd.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..89240865597787934f2908e60d83231a1b651319
+--- /dev/null
++++ b/source/blender/gpu/vulkan/vk_nrd.cc
+@@ -0,0 +1,318 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup gpu
++ *
++ * Minimal NVIDIA NRD integration for the Vulkan backend.
++ *
++ * NRD is optional and only available in builds that link the external NRD/NRI
++ * libraries. The denoiser is recorded into a dedicated one-shot command buffer
++ * and submitted on Blender's graphics queue.
++ */
++
++#include <cstring>
++
++#include "BLI_assert.hh"
++
++#include "GPU_nrd.hh"
++
++#include "gpu_backend.hh"
++
++#include "vk_backend.hh"
++#include "vk_common.hh"
++#include "vk_device.hh"
++#include "vk_texture.hh"
++
++#include <NRI.h>
++#include <Extensions/NRIHelper.h>
++#include <Extensions/NRIRayTracing.h>
++#include <Extensions/NRIWrapperVK.h>
++#include <NRD.h>
++#include "NRDIntegration.hpp"
++
++namespace blender::gpu {
++
++namespace {
++
++struct NrdState {
++  nrd::Integration integration;
++  nrd::Identifier denoiser_id;
++  bool initialized = false;
++  int width = 0;
++  int height = 0;
++  uint32_t frame_index = 0;
++  float prev_view_to_clip[16] = {};
++  float prev_world_to_view[16] = {};
++  bool has_prev = false;
++  bool force_reset = false;
++  VkCommandPool command_pool = VK_NULL_HANDLE;
++  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
++  VkFence fence = VK_NULL_HANDLE;
++};
++
++static NrdState *g_nrd_heap = new NrdState();
++static NrdState &g_nrd = *g_nrd_heap;
++
++static nrd::Resource nrd_resource(Texture *texture)
++{
++  VKTexture *vk_texture = static_cast<VKTexture *>(texture);
++  nrd::Resource resource = {};
++  resource.vk.image = (VKNonDispatchableHandle)vk_texture->vk_image_handle();
++  resource.vk.format = (VKEnum)to_vk_format(vk_texture->device_format_get());
++  resource.state.access = nri::AccessBits::SHADER_RESOURCE_STORAGE;
++  resource.state.layout = nri::Layout::GENERAL;
++  resource.state.stages = nri::StageBits::COMPUTE_SHADER;
++  return resource;
++}
++
++static bool nrd_init(VKDevice &device, int width, int height)
++{
++  if (g_nrd.initialized && g_nrd.width == width && g_nrd.height == height) {
++    return true;
++  }
++
++  if (g_nrd.initialized) {
++    g_nrd.integration.Destroy();
++    g_nrd.initialized = false;
++  }
++
++  /* NRD-Sample defaults to REBLUR at full resolution. It is more robust at geometry
++   * silhouettes than RELAX, whose 16x16 sky tiles can leave black fringes around edges. */
++  g_nrd.denoiser_id = nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR);
++
++  nrd::DenoiserDesc denoiser_desc = {};
++  denoiser_desc.identifier = g_nrd.denoiser_id;
++  denoiser_desc.denoiser = nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR;
++
++  nrd::InstanceCreationDesc instance_desc = {};
++  instance_desc.denoisers = &denoiser_desc;
++  instance_desc.denoisersNum = 1;
++
++  nrd::IntegrationCreationDesc integration_desc = {};
++  std::strncpy(integration_desc.name, "EEVEE", sizeof(integration_desc.name) - 1);
++  integration_desc.resourceWidth = uint16_t(width);
++  integration_desc.resourceHeight = uint16_t(height);
++  integration_desc.queuedFrameNum = 1;
++  integration_desc.autoWaitForIdle = false;
++  integration_desc.promoteFloat16to32 = false;
++  integration_desc.demoteFloat32to16 = false;
++
++  nri::QueueFamilyVKDesc queue_family = {};
++  queue_family.familyIndex = device.queue_family_get();
++  queue_family.queueType = nri::QueueType::GRAPHICS;
++  queue_family.queueNum = 1;
++
++  nri::DeviceCreationVKDesc device_desc = {};
++  device_desc.vkInstance = (VKHandle)device.instance_get();
++  device_desc.vkPhysicalDevice = (VKHandle)device.physical_device_get();
++  device_desc.vkDevice = (VKHandle)device.vk_handle();
++  device_desc.minorVersion = 3;
++  device_desc.queueFamilies = &queue_family;
++  device_desc.queueFamilyNum = 1;
++  device_desc.enableNRIValidation = false;
++
++  if (g_nrd.integration.RecreateVK(integration_desc, instance_desc, device_desc) !=
++      nrd::Result::SUCCESS)
++  {
++    return false;
++  }
++
++  /* Copied from NRD-Sample's default REBLUR settings (NRDSample.cpp:271 and :580).
++   * The sample uses 31 accumulated / 7 fast frames, full-res checkerboard OFF and
++   * anti-firefly OFF. Our specular channel also contains dielectric highlights, so
++   * minMaterialForSpecular is 0 instead of the sample's metal-only 1. */
++  nrd::ReblurSettings settings = {};
++  settings.maxAccumulatedFrameNum = 31;
++  settings.maxFastAccumulatedFrameNum = 7;
++  settings.maxStabilizedFrameNum = 31;
++  settings.fastHistoryClampingSigmaScale = 1.5f;
++  settings.minMaterialForDiffuse = 0.0f;
++  settings.minMaterialForSpecular = 0.0f;
++  settings.enableAntiFirefly = false;
++  settings.checkerboardMode = nrd::CheckerboardMode::OFF;
++  settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
++  g_nrd.integration.SetDenoiserSettings(g_nrd.denoiser_id, &settings);
++
++  g_nrd.width = width;
++  g_nrd.height = height;
++  g_nrd.frame_index = 0;
++  g_nrd.has_prev = false;
++  g_nrd.force_reset = true;
++  g_nrd.initialized = true;
++  return true;
++}
++
++}  // namespace
++
++bool nrd_denoise(const NrdDenoiseInput &input)
++{
++  if (!input.color || !input.specular || !input.normal_roughness || !input.viewz ||
++      !input.motion || !input.output || !input.output_specular || input.width <= 0 ||
++      input.height <= 0)
++  {
++    return false;
++  }
++  if (input.width > 65535 || input.height > 65535) {
++    return false;
++  }
++
++  GPUBackend *backend = GPUBackend::get();
++  if (backend == nullptr) {
++    return false;
++  }
++  VKBackend *vk_backend = dynamic_cast<VKBackend *>(backend);
++  if (vk_backend == nullptr) {
++    return false;
++  }
++  VKDevice &device = vk_backend->device;
++
++  if (!nrd_init(device, input.width, input.height)) { printf("[NRD] Init failed!\n");
++    return false;
++  }
++
++  VkDevice vk_device = device.vk_handle();
++  VkQueue vk_queue = device.queue_get();
++  if (vk_device == VK_NULL_HANDLE || vk_queue == VK_NULL_HANDLE) {
++    return false;
++  }
++
++  if (g_nrd.command_pool == VK_NULL_HANDLE) {
++    VkCommandPoolCreateInfo pool_info = {};
++    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++    pool_info.queueFamilyIndex = device.queue_family_get();
++    if (device.functions.vkCreateCommandPool(
++            vk_device, &pool_info, nullptr, &g_nrd.command_pool) != VK_SUCCESS)
++    {
++      return false;
++    }
++  }
++
++  if (g_nrd.command_buffer == VK_NULL_HANDLE) {
++    VkCommandBufferAllocateInfo alloc_info = {};
++    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    alloc_info.commandPool = g_nrd.command_pool;
++    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    alloc_info.commandBufferCount = 1;
++    if (device.functions.vkAllocateCommandBuffers(
++            vk_device, &alloc_info, &g_nrd.command_buffer) != VK_SUCCESS)
++    {
++      return false;
++    }
++  }
++
++  if (g_nrd.fence == VK_NULL_HANDLE) {
++    VkFenceCreateInfo fence_info = {};
++    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    if (device.functions.vkCreateFence(vk_device, &fence_info, nullptr, &g_nrd.fence) != VK_SUCCESS)
++    {
++      return false;
++    }
++  }
++
++  g_nrd.integration.NewFrame();
++
++  nrd::CommonSettings common_settings = {};
++  if (input.view_to_clip) {
++    std::memcpy(common_settings.viewToClipMatrix, input.view_to_clip, 16 * sizeof(float));
++    std::memcpy(common_settings.viewToClipMatrixPrev,
++                g_nrd.has_prev ? g_nrd.prev_view_to_clip : input.view_to_clip,
++                16 * sizeof(float));
++  }
++  if (input.world_to_view) {
++    std::memcpy(common_settings.worldToViewMatrix, input.world_to_view, 16 * sizeof(float));
++    std::memcpy(common_settings.worldToViewMatrixPrev,
++                g_nrd.has_prev ? g_nrd.prev_world_to_view : input.world_to_view,
++                16 * sizeof(float));
++  }
++
++  if (input.view_to_clip && input.world_to_view) {
++    std::memcpy(g_nrd.prev_view_to_clip, input.view_to_clip, 16 * sizeof(float));
++    std::memcpy(g_nrd.prev_world_to_view, input.world_to_view, 16 * sizeof(float));
++    g_nrd.has_prev = true;
++  }
++
++  const bool reset_history = input.reset_history || g_nrd.force_reset;
++  g_nrd.force_reset = false;
++
++  common_settings.motionVectorScale[0] = 1.0f / float(input.width);
++  common_settings.motionVectorScale[1] = 1.0f / float(input.height);
++  /* 2.5D screen-space motion: xy in pixels, z = viewZprev - viewZ. */
++  common_settings.motionVectorScale[2] = 1.0f;
++  common_settings.resourceSize[0] = uint16_t(input.width);
++  common_settings.resourceSize[1] = uint16_t(input.height);
++  common_settings.resourceSizePrev[0] = uint16_t(input.width);
++  common_settings.resourceSizePrev[1] = uint16_t(input.height);
++  common_settings.rectSize[0] = uint16_t(input.width);
++  common_settings.rectSize[1] = uint16_t(input.height);
++  common_settings.rectSizePrev[0] = uint16_t(input.width);
++  common_settings.rectSizePrev[1] = uint16_t(input.height);
++  common_settings.viewZScale = input.view_z_scale;
++  common_settings.denoisingRange = input.denoising_range;
++  common_settings.cameraJitter[0] = input.camera_jitter[0];
++  common_settings.cameraJitter[1] = input.camera_jitter[1];
++  common_settings.cameraJitterPrev[0] = input.camera_jitter_prev[0];
++  common_settings.cameraJitterPrev[1] = input.camera_jitter_prev[1];
++  common_settings.disocclusionThreshold = 0.01f;
++  common_settings.disocclusionThresholdAlternate = 0.1f;
++  common_settings.frameIndex = g_nrd.frame_index++;
++  common_settings.accumulationMode = reset_history ? nrd::AccumulationMode::CLEAR_AND_RESTART :
++                                                      nrd::AccumulationMode::CONTINUE;
++  common_settings.isMotionVectorInWorldSpace = false;
++  common_settings.isHistoryConfidenceAvailable = false;
++  g_nrd.integration.SetCommonSettings(common_settings);
++
++  nrd::ResourceSnapshot snapshot = {};
++  snapshot.restoreInitialState = true;
++  snapshot.SetResource(nrd::ResourceType::IN_MV, nrd_resource(input.motion));
++  snapshot.SetResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS,
++                       nrd_resource(input.normal_roughness));
++  snapshot.SetResource(nrd::ResourceType::IN_VIEWZ, nrd_resource(input.viewz));
++  snapshot.SetResource(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, nrd_resource(input.color));
++  snapshot.SetResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, nrd_resource(input.output));
++  snapshot.SetResource(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, nrd_resource(input.specular));
++  snapshot.SetResource(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST,
++                       nrd_resource(input.output_specular));
++
++  if (device.functions.vkResetCommandPool(vk_device, g_nrd.command_pool, 0) != VK_SUCCESS) {
++    return false;
++  }
++  if (device.functions.vkResetFences(vk_device, 1, &g_nrd.fence) != VK_SUCCESS) {
++    return false;
++  }
++
++  VkCommandBufferBeginInfo begin_info = {};
++  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  if (device.functions.vkBeginCommandBuffer(g_nrd.command_buffer, &begin_info) != VK_SUCCESS) {
++    return false;
++  }
++
++  nri::CommandBufferVKDesc command_buffer_desc = {};
++  command_buffer_desc.vkCommandBuffer = (VKHandle)(uintptr_t)g_nrd.command_buffer;
++  command_buffer_desc.queueType = nri::QueueType::GRAPHICS;
++  g_nrd.integration.DenoiseVK(&g_nrd.denoiser_id, 1, command_buffer_desc, snapshot);
++
++  if (device.functions.vkEndCommandBuffer(g_nrd.command_buffer) != VK_SUCCESS) {
++    return false;
++  }
++
++  VkSubmitInfo submit_info = {};
++  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++  submit_info.commandBufferCount = 1;
++  submit_info.pCommandBuffers = &g_nrd.command_buffer;
++  if (device.functions.vkQueueSubmit(vk_queue, 1, &submit_info, g_nrd.fence) != VK_SUCCESS) {
++    return false;
++  }
++  if (device.functions.vkWaitForFences(vk_device, 1, &g_nrd.fence, VK_TRUE, UINT64_MAX) !=
++      VK_SUCCESS)
++  {
++    return false;
++  }
++
++  return true;
++}
++
++}  // namespace blender::gpu
+diff --git a/source/blender/gpu/vulkan/vk_ray_tracing.cc b/source/blender/gpu/vulkan/vk_ray_tracing.cc
+index 42895db9d6113aa00484bec9d3e7c0276b0e7c10..e5c6e57edc841de7a6e3ab3b63920fd7868b544a 100644
+--- a/source/blender/gpu/vulkan/vk_ray_tracing.cc
++++ b/source/blender/gpu/vulkan/vk_ray_tracing.cc
+@@ -58,13 +58,18 @@ VKTopLevelAS::~VKTopLevelAS()
+ 
+ InstanceID VKTopLevelAS::add_instance(const BottomLevelAS &blas_,
+                                       const float4x4 &mat,
+-                                      const uint8_t mask)
++                                      const InstanceInfo &info)
+ {
+   BLI_assert_msg(vk_acceleration_structure_ == VK_NULL_HANDLE,
+                  "Adding instances to an existing acceleration structure isn't supported. "
+                  "Updating an existing instance of an acceleration structure is supported via the "
+                  "update_instance methods.");
+ 
++  if (info.custom_index >= (1u << 24)) {
++    CLOG_ERROR(&LOG, "Instance custom index exceeds the 24 bit Vulkan limit.");
++    return {-1};
++  }
++
+   VKDevice &device = VKBackend::get().device;
+   const VkPhysicalDeviceAccelerationStructurePropertiesKHR &acceleration_structure_properties =
+       device.physical_device_acceleration_structure_properties_get();
+@@ -81,9 +86,9 @@ InstanceID VKTopLevelAS::add_instance(const BottomLevelAS &blas_,
+       {{{mat.x.x, mat.y.x, mat.z.x, mat.w.x},
+         {mat.x.y, mat.y.y, mat.z.y, mat.w.y},
+         {mat.x.z, mat.y.z, mat.z.z, mat.w.z}}},
+-      0,    /* instanceCustomIndex */
+-      mask, /* mask */
+-      0,    /* instanceShaderBindingTableRecordOffset */
++      info.custom_index, /* instanceCustomIndex */
++      info.mask,         /* mask */
++      0,                 /* instanceShaderBindingTableRecordOffset */
+       0,    /* flags */
+       0,    /* device address */
+   });
+@@ -94,12 +99,18 @@ InstanceID VKTopLevelAS::add_instance(const BottomLevelAS &blas_,
+   return instance_id;
+ }
+ 
+-void VKTopLevelAS::update_instance(InstanceID instance_id, const float4x4 &mat, uint8_t mask)
++void VKTopLevelAS::update_instance(InstanceID instance_id,
++                                   const float4x4 &mat,
++                                   const InstanceInfo &info)
+ {
+   BLI_assert(instance_id.id < max_primitive_count_);
+   if (instance_id.id < 0 || instance_id.id >= max_primitive_count_) {
+     return;
+   }
++  if (info.custom_index >= (1u << 24)) {
++    CLOG_ERROR(&LOG, "Instance custom index exceeds the 24 bit Vulkan limit.");
++    return;
++  }
+ 
+   VkAccelerationStructureInstanceKHR &instance = instances_[instance_id.id];
+   /* The API order is row major. Transpose the matrix. */
+@@ -115,7 +126,8 @@ void VKTopLevelAS::update_instance(InstanceID instance_id, const float4x4 &mat,
+   instance.transform.matrix[2][1] = mat.y.z;
+   instance.transform.matrix[2][2] = mat.z.z;
+   instance.transform.matrix[2][3] = mat.w.z;
+-  instance.mask = mask;
++  instance.instanceCustomIndex = info.custom_index;
++  instance.mask = info.mask;
+ 
+   is_dirty_ = true;
+ }
+diff --git a/source/blender/gpu/vulkan/vk_ray_tracing.hh b/source/blender/gpu/vulkan/vk_ray_tracing.hh
+index 6c29cfe4fb5500f491ca3501a7f4a503f0a48895..ccb7b2c10c80a2416bb9d98c34bb1c6ea2b878fc 100644
+--- a/source/blender/gpu/vulkan/vk_ray_tracing.hh
++++ b/source/blender/gpu/vulkan/vk_ray_tracing.hh
+@@ -39,8 +39,12 @@ class VKTopLevelAS : public TopLevelAS {
+  public:
+   VKTopLevelAS(const char *name);
+   ~VKTopLevelAS();
+-  InstanceID add_instance(const BottomLevelAS &blas, const float4x4 &mat, uint8_t mask) override;
+-  void update_instance(InstanceID instance_id, const float4x4 &mat, uint8_t mask) override;
++  InstanceID add_instance(const BottomLevelAS &blas,
++                          const float4x4 &mat,
++                          const InstanceInfo &info) override;
++  void update_instance(InstanceID instance_id,
++                       const float4x4 &mat,
++                       const InstanceInfo &info) override;
+   void build() override;
+   void bind(int slot) override;
+ 
+diff --git a/source/blender/makesdna/DNA_scene_types.h b/source/blender/makesdna/DNA_scene_types.h
+index de9d01456f2d98ff452a736268220aed5517730e..0fe03d9610d79405f9cecdecd9fc01610efd298a 100644
+--- a/source/blender/makesdna/DNA_scene_types.h
++++ b/source/blender/makesdna/DNA_scene_types.h
+@@ -2615,13 +2615,21 @@ enum RaytraceEEVEE_DenoiseStages : int {
+ ENUM_OPERATORS(RaytraceEEVEE_DenoiseStages)
+ 
+ enum RaytraceEEVEE_Method : int {
+-  /* NOTE: Each method contains the previous one. */
+   RAYTRACE_EEVEE_METHOD_PROBE = 0,
+   RAYTRACE_EEVEE_METHOD_SCREEN = 1,
+-  /* TODO(fclem): Hardware ray-tracing. */
+-  // RAYTRACE_EEVEE_METHOD_HARDWARE = 2,
++  /* Hardware ray query path tracing. */
++  RAYTRACE_EEVEE_METHOD_PATH_TRACING = 2,
+ };
+ 
++/** #SceneEEVEE::pathtracing_channels */
++enum PathTracingEEVEE_Channel : int {
++  PATHTRACING_EEVEE_CHANNEL_DIRECT = (1 << 0),
++  PATHTRACING_EEVEE_CHANNEL_DIFFUSE = (1 << 1),
++  PATHTRACING_EEVEE_CHANNEL_SPECULAR = (1 << 2),
++  PATHTRACING_EEVEE_CHANNEL_DENOISE = (1 << 3),
++};
++ENUM_OPERATORS(PathTracingEEVEE_Channel)
++
+ /**
+  * Ray-tracing parameters.
+  */
+@@ -2743,6 +2751,10 @@ struct SceneEEVEE {
+   float clamp_volume_direct = 0;
+   float clamp_volume_indirect = 0;
+ 
++  /** Total path length in the path tracing mode. */
++  int pathtracing_max_bounces = 8;
++  char _pad3[4] = {};
++
+   /** Global lighting intensity. */
+   float direct_light_intensity = 1.0f;
+   float indirect_light_intensity = 1.0f;
+@@ -2755,7 +2767,12 @@ struct SceneEEVEE {
+   float light_threshold = 0.01f;
+ 
+   float time_limit = 0.0f;
+-  char _pad2[12] = {};
++  /** Bitmask of #PathTracingEEVEE_Channel. */
++  int pathtracing_channels = 15;
++  int pathtracing_debug_view = 0;
++  /** False in files saved before the path tracing channels existed. */
++  char pathtracing_channels_initialized = 1;
++  char _pad2[3] = {};
+ };
+ 
+ struct SceneGpencil {
+diff --git a/source/blender/makesrna/intern/rna_scene.cc b/source/blender/makesrna/intern/rna_scene.cc
+index 23a59c2d9d4fe083fa3c83e81dcd56a185c0019c..7ebb6c6c850e630f68f096fd0ed25bd2751034b6 100644
+--- a/source/blender/makesrna/intern/rna_scene.cc
++++ b/source/blender/makesrna/intern/rna_scene.cc
+@@ -8526,6 +8526,28 @@ static void rna_def_scene_eevee(BlenderRNA *brna)
+        0,
+        "Screen-Trace",
+        "Raytrace against the depth buffer. Fallback to light probes for invalid rays."},
++      {RAYTRACE_EEVEE_METHOD_PATH_TRACING,
++       "PATH_TRACING",
++       0,
++       "Path Tracing",
++       "Trace complete light paths using hardware ray queries"},
++      {0, nullptr, 0, nullptr, nullptr},
++  };
++
++  static const EnumPropertyItem pathtracing_debug_view_items[] = {
++      {0, "COMPOSITE", 0, "Composite", "Final composed path traced image"},
++      {1, "DENOISED_DIFFUSE", 0, "Denoised Diffuse", "Denoised diffuse indirect lighting"},
++      {2,
++       "DENOISED_SPECULAR",
++       0,
++       "Denoised Specular",
++       "Denoised specular indirect lighting"},
++      {3, "RAW_DIFFUSE", 0, "Raw Diffuse", "Raw diffuse indirect lighting"},
++      {4, "RAW_SPECULAR", 0, "Raw Specular", "Raw specular indirect lighting"},
++      {5, "DIFFUSE_HIT_DISTANCE", 0, "Diffuse Hit Distance", "Diffuse path hit distance"},
++      {6, "SPECULAR_HIT_DISTANCE", 0, "Specular Hit Distance", "Specular path hit distance"},
++      {7, "INDIRECT", 0, "Indirect", "Denoised diffuse and specular indirect lighting"},
++      {8, "DIRECT", 0, "Direct", "Primary-surface direct lighting"},
+       {0, nullptr, 0, nullptr, nullptr},
+   };
+ 
+@@ -8656,6 +8678,47 @@ static void rna_def_scene_eevee(BlenderRNA *brna)
+   RNA_def_property_update(
+       prop, NC_SCENE | ND_RENDER_OPTIONS, "rna_SceneEEVEE_clamp_surface_indirect_update");
+ 
++  /* Path Tracing */
++  prop = RNA_def_property(srna, "pathtracing_max_bounces", PROP_INT, PROP_NONE);
++  RNA_def_property_ui_text(prop,
++                           "Path Tracing Max Bounces",
++                           "Maximum number of path segments traced for each camera ray");
++  RNA_def_property_range(prop, 1, 64);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "pathtracing_use_direct", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(
++      prop, nullptr, "pathtracing_channels", PATHTRACING_EEVEE_CHANNEL_DIRECT);
++  RNA_def_property_ui_text(prop, "Direct", "Include primary-surface direct lighting");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "pathtracing_use_diffuse", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(
++      prop, nullptr, "pathtracing_channels", PATHTRACING_EEVEE_CHANNEL_DIFFUSE);
++  RNA_def_property_ui_text(prop, "Diffuse", "Include diffuse indirect lighting");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "pathtracing_use_specular", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(
++      prop, nullptr, "pathtracing_channels", PATHTRACING_EEVEE_CHANNEL_SPECULAR);
++  RNA_def_property_ui_text(prop, "Specular", "Include specular indirect lighting");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "pathtracing_use_denoise", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(
++      prop, nullptr, "pathtracing_channels", PATHTRACING_EEVEE_CHANNEL_DENOISE);
++  RNA_def_property_ui_text(prop, "Denoise", "Denoise indirect lighting using NRD");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "pathtracing_debug_view", PROP_ENUM, PROP_NONE);
++  RNA_def_property_enum_items(prop, pathtracing_debug_view_items);
++  RNA_def_property_ui_text(prop, "Debug View", "Select which path tracing channel to display");
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
+   prop = RNA_def_property(srna, "clamp_volume_direct", PROP_FLOAT, PROP_NONE);
+   RNA_def_property_ui_text(prop,
+                            "Clamp Volume Direct",

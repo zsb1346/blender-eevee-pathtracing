@@ -1,0 +1,15 @@
+# Local build/test output
+build/
+test_results/
+*.log
+*.out
+*.err
+*.blend1
+*.blend2
+__pycache__/
+*.py[cod]
+
+# Local diagnostics
+*.bak
+*.bak_*
+*.patch.tmp
