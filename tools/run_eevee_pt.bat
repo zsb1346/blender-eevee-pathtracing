@@ -1,7 +1,23 @@
 @echo off
 setlocal EnableExtensions
 
-if not defined BLENDER_EXE set "BLENDER_EXE=blender.exe"
+if not defined BLENDER_EXE (
+  if exist "D:\build_windows_x64_vc17_Release\bin\Release\blender.exe" (
+    set "BLENDER_EXE=D:\build_windows_x64_vc17_Release\bin\Release\blender.exe"
+  ) else (
+    set "BLENDER_EXE=blender.exe"
+  )
+)
+
+if not exist "%BLENDER_EXE%" (
+  where "%BLENDER_EXE%" >nul 2>nul
+  if errorlevel 1 (
+    echo [EEVEE Path Tracing] Blender executable not found: %BLENDER_EXE%
+    echo Set BLENDER_EXE to the Blender build that contains the patch.
+    pause
+    exit /b 1
+  )
+)
 
 if not defined VK_ICD_FILENAMES (
   for /d %%D in ("C:\Windows\System32\DriverStore\FileRepository\nvtfi.inf_amd64_*") do (

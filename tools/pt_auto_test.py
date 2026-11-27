@@ -31,6 +31,9 @@ PT_ENV_KEYS = (
     "EEVEE_PT_NO_NRD_HISTORY",
     "EEVEE_PT_DEBUG_VIEW",
     "EEVEE_PT_DEBUG_FLAGS",
+    "EEVEE_PT_NRD_VALIDATE",
+    "EEVEE_PT_USE_RR",
+    "EEVEE_PT_DUMP_MATERIALS",
 )
 
 CASES = {
@@ -51,6 +54,8 @@ CASES = {
     "direct": {"EEVEE_PT_DEBUG_VIEW": "8"},
     "no_direct_1spp": {"EEVEE_PT_DEBUG_FLAGS": "2"},
     "no_bsdf_spec": {"EEVEE_PT_DEBUG_FLAGS": "4"},
+    "validation": {"EEVEE_PT_NRD_VALIDATE": "1"},
+    "rr": {"EEVEE_PT_USE_RR": "1"},
 }
 
 DEFAULT_CASES = (

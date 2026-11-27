@@ -462,9 +462,9 @@ MVP：
 - 时序缓冲需要 motion vector、normal/roughness、viewZ、hit distance、confidence。
 - 超分后置，避免首阶段复杂化。
 
-#### 4.5.1 NRD 原型契约（2026-11-17）
+#### 4.5.1 NRD 原型契约（2026-11-17；2026-11-27 build18 更新）
 
-状态：IN_PROGRESS。NRD 4.17.1 + NRI + `RELAX_DIFFUSE` 已接入；能编译并在 F12 出图，但世界背景全黑和相机旋转鬼影未解决。
+状态：NRD 4.17.1 + NRI + REBLUR 已接入；validation overlay、材质 dump、概率契约、TAA、运动矢量/历史键与能量守恒均已修复。当前 exe（build18）稳定健康，高速移动/转视角下 Viewport 3（MV 误差）全程纯黑、累积轨迹与 NRD-Sample 一致。本节的「已知缺陷」已全部关闭，历史过程见 `docs/STATUS.md` 与 `docs/FIX_CHECKLIST.md`。
 
 数据流：
 
@@ -491,14 +491,14 @@ NRD 输入约定：
 - `IN_DIFF_RADIANCE_HITDIST`：rgb 为路径追踪辐射度，a 为世界空间 hit distance；天空的 hit distance 为 0。
 - `IN_NORMAL_ROUGHNESS`：必须使用与 NRD `_NRD_EncodeNormalRoughness101010` 一致的 R10G10B10A2 packed 编码；不能用 RGBA8 裸法线。
 - `IN_VIEWZ`：view 空间正深度；miss/sky 必须为 `+INF`（`uintBitsToFloat(0x7F800000u)`），NRD composition 用 `abs(viewZ) >= INF` 判定天空。
-- `IN_MV`：像素位移 `(prev_uv - curr_uv) * resolution`；`commonSettings.motionVectorScale = (1/width, 1/height, 0)`，与 NRD-Sample 的 `GetMotion` 约定一致。
-- `CommonSettings`：当前和上一帧 view-to-clip/world-to-view 矩阵必须成对正确；历史累积用 `CONTINUE`，重置用 `CLEAR_AND_RESTART`。
+- `IN_MV`：像素位移 `(prev_uv - curr_uv) * resolution`，且 `motion.y` 取反（NRD 输入纹理统一 top-down / Y 翻转）；z 分量为 `viewZprev - viewZ`（世界单位），即使上一帧命中点投影到屏幕外也必须保留——disocclusion 判定消费该值，出屏历史由 NRD 自身的 in-screen 检查拒绝。**prev/curr 都用 unjittered 的 DX `[0,1]` 矩阵投影，无需手动 jitter delta**（与 NRD-Sample 的 `GetMotion` 等价）。投影函数 `project_screen_uv_unbounded` 只检查 `clip.w > 1e-6`，不截断 `[0,1]`，让屏幕外进入的像素带真实越界 MV；旧的带 clamp 的 `project_screen_uv` 保留。`commonSettings.motionVectorScale = (1/width, 1/height, 1)`（z 单位不变），`isMotionVectorInWorldSpace = false`。
+- `CommonSettings`：当前和上一帧 view-to-clip/world-to-view 矩阵必须成对正确，且都是 main_view 的 unjittered 矩阵（`nrd_view_to_clip` 由 winmat 转 DX `[0,1]`，只改 Z 行 `0.5*z+0.5*w`）；`cameraJitter`/`cameraJitterPrev` 的 y 取反。历史累积用 `CONTINUE`，重置用 `CLEAR_AND_RESTART`。
 
 历史重置：
 
-- 视口：`Sampling::is_reset()`。
-- F12：`sample_index() == 0`。
-- `Sampling::is_reset()`/`reset()` 内部断言仅 viewport 可用，F12 调用会触发 `BLI_assert`，必须分支处理。
+- NRD reset 用 `new_session`，只含 `!started || resolution_changed || frame_jump`，**不含 `sampling_reset`**；转视角（`camera_has_motion` → `sampling.reset()`）不再触发 NRD 历史清空。对照 NRD-Sample：`PrepareFrame` 每帧 `m_ForceHistoryReset=false`，相机移动靠 motion vector + normal/depth 拒绝失效历史，`accumulationMode` 恒为 `CONTINUE`。
+- TAA 双缓冲仍用 `new_session || sampling_reset` 重置（无拖影）；`prev_jitter_` 只在真正 new_session 时设为当前 jitter，转视角保留真实上一帧 jitter 供 NRD jitter delta 用。
+- F12：`sample_index() == 0`；`Sampling::is_reset()`/`reset()` 内部断言仅 viewport 可用，F12 需分支处理。
 - 不再使用“相机变化就跳过 NRD”的方案；该方案会消除鬼影但失去时序累积，达不到参考项目效果。
 
 构建/分发：
@@ -507,11 +507,16 @@ NRD 输入约定：
 - `NRI.dll` 静态依赖 `libxess.dll`；`NRD.dll`、`NRI.dll`、`libxess.dll` 必须与 `blender.exe` 同目录。
 - 当前 CMake 为原型硬编码本机路径；最终必须改为可选 `WITH_NRD`，object-code 动态库分发并经过许可证审查。
 
-已知缺陷：
+历史缺陷（均已修复，2026-11-27 build18）：
 
-- F12 世界背景纯黑；EEVEE-only 对照正常，问题在 PT/NRD 路径。
-- 相机旋转鬼影；运动矢量、prev 矩阵和 reset 时序仍需验证。
-- 诊断期间曾临时把 copy 目标改成 `nrd_diffuse_tx`，下一步必须先还原 `nrd_output_tx`。
+- ~~F12 世界背景纯黑~~：随 `aux_buf_` 越界修复与 render 期 extent 分配解决（见 `docs/STATUS.md` 间接光近 0 回归）。
+- ~~相机旋转鬼影 / 满地红斑 / viewport3 全黄~~：根因是 history key 用 `ob->index`（Pass Index）碰撞，改 `draw::ObjectKey` + Y 翻转 + unjittered DX 矩阵 + 越界 MV 后消失；转视角不再清空 NRD 历史。
+- ~~诊断期 copy 目标临时改成 `nrd_diffuse_tx`~~：已还原 `nrd_output_tx`。
+
+#### 4.5.1.1 能量守恒与历史键（2026-11-27 build18）
+
+- **间接漫反射能量守恒**：直接光漫反射有 `(1-Fresnel)` 补偿，但间接漫反射（主交点 `lobe==0` 与 bounce>=1 的 `!sample_specular`）曾漏乘，非金属掠射角 F 达 0.3–0.9 时镜面 lobe + 漫反射 lobe 总反照率 > 1，半封闭空间越弹越亮。修复：新增 `smith_lambda`/`smith_g2_over_g1`（高度相关 Smith GGX G2/G1），主交点与次级反弹的 specular lobe 权重用 `smith_g2_over_g1(p_ndotv, ndotl, alpha2)`，diffuse lobe 用 `p_diffuse_color * (1 - f_env)`，`f_env = nrd_environment_term(...)`。直接光 geometry 项仍用 `smith_g1`（按方案不动）。`nrd_material_factors` 的 diff/spec factor 是解调因子，与采样权重用途不同，未改。
+- **历史键**：`PathTracingModule` 的 `prev_object_to_world_` / `current_object_to_world_` 用 `Map<draw::ObjectKey, float4x4>`。ObjectKey 来自 `draw/intern/draw_handle.hh`，构造 `ObjectKey(ob_ref, i)` 内部处理 `DEG_get_original` + `DupliObject::persistent_id` + `sub_key_`，与 EEVEE VelocityModule 同源，覆盖普通物体、CoW、Alt+D、集合实例、几何节点动态实例。BLAS 以 `Map<const Mesh*, ObjectGeometry>` 共享，`last_used_sync` 按 `sync_id_` 回收。
 
 ### 4.6 视口与合成器
 
@@ -651,3 +656,14 @@ virtual void update_instance(InstanceID id,
 - 前置修复：BLAS 使用排序/隐藏面过滤后的 IBO，PT primitive 表必须一致；`materials_num` 与 `totcol`/`material_base` 对齐。实测多材质红蓝面交换。
 - 独立风险：Checker Texture 接 Base Color 当前变纯绿；64 样本无 AA；`rayQueryProceed` 只调用一次，未按 Vulkan 规范循环。
 - 主要未决：compute 属性 domain、纹理/bump 导数、多材质资源绑定、closure 容量/MIS、`target_engine_` 选择。详见 `RESEARCH_LOG.md` R-028/R-030。
+
+## 17. 2026-11-25 修复：NRD 契约、clamp 与 TAA
+
+- 概率：`estimate_diffuse_probability` 对齐 NRD-Sample，返回 `lumDiff / max(lumDiff + lumSpec, eps)`，clamp `[0.05, 0.95]`，`<0.005`/`>0.995` 返回精确 0/1；primary bounce 用 `[0.25, 0.75]`，后续 bounce 用原始概率。
+- 采样：NRD 采样点使用 Bayer 4x4 dither；NRD 设置 `AREA_3X3`、`enableAntiFirefly=true`、prepass 半径 30/50。
+- RR：默认关闭，`EEVEE_PT_USE_RR=1` 映射到 debug flag bit 16，仅用于 A/B；移除的是旧 RR 分支里的 `(1-F)` 写法。**build18 另在主交点/次级 bounce 的 lobe 采样权重上补回 `(1-F_env)`**（见 4.5.1.1），作用位置不同，不矛盾。
+- clamp：背景、fallback、direct、BSDF specular、最终 1000 安全 clamp 改为 luminance-preserving；throughput 阈值 0.001；最终 accumulation 做 NaN/INF sanitization。
+- TAA：误差改为 `luma*0.5 + length(chroma)*2.0`；`min_weight = mix(0.0606, 0.5, distrust)`，`distrust = max(length(motion)/10, length(sigma)/0.5)`；相机/场景变化时重置 NRD/TAA history。
+- 诊断：新增 `OUT_VALIDATION` 覆盖层（RGBA8，`lerp(base, validation.rgb, validation.a)`）和 `EEVEE_PT_DUMP_MATERIALS` 材质 JSON dump。
+- 验证：room 场景 64 spp 下 `normal/no_history/raw` 无异常；`validation` 输出 4x4 覆盖层；`rr` 与 normal 有可测差异；GUI 静止 80 redraws + 移动后 80 redraws 未复现红弧。
+- 限制：headless still 每次从 sample 0 开始，跨帧 TAA history 不连续；跨帧验证需要 GUI viewport 或多 redraw harness。

@@ -1,0 +1,15 @@
+{
+  "blender": "5.3.0 Beta",
+  "scene": "D:\\\u4e0b\u8f7d\\blender-eevee-pathtracing\\scenes\\pt_test_motion.blend",
+  "out": "D:\\\u4e0b\u8f7d\\blender-eevee-pathtracing\\baseline\\pt_test_motion",
+  "frames": [
+    1,
+    10
+  ],
+  "samples": 16,
+  "percent": 50,
+  "resolution": [
+    320,
+    240
+  ]
+}

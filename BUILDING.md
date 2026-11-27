@@ -1,5 +1,7 @@
 # Building
 
+> 当前状态（2026-11-27）：本文构建步骤有效，当前稳定 exe 为 build18（`D:\build_windows_x64_vc17_Release\bin\Release\blender.exe`，MTIME `15:53:18`）。增量构建前须确认无 Blender 进程占用 exe，并注意 Agent shell 中大小写重复环境变量（`PATH`/`Path` 等）会导致 MSBuild `MSB6001`，需先去重（见 `docs/STATUS.md`）。
+
 ## 1. 获取 Blender 源码
 
 补丁基于 Blender 5.3 release 基线提交 `7463664d`。
@@ -40,6 +42,8 @@ cmake -S . -B ..\build_windows_x64_vc17_Release `
 ```
 
 如果 CMake 报 `NRD_SAMPLE_ROOT is not set`，说明路径没有传进去。
+
+> 版本兼容：文档与 README 以 4.17.1 为准；当前实际构建用的是 `D:/下载/nrd418/root`（NRD 4.18）+ NRI，4.17.1 与 4.18 的 API 互相兼容。NRD-Sample 4.17.1（旧固定版）与 `NRD-Sample-main`（面向 4.18 API）都在本地，后者更适合逐帧 dispatch 对照。
 
 ## 4. 构建
 
@@ -88,6 +92,11 @@ $env:VK_ICD_FILENAMES = "C:\Windows\System32\DriverStore\FileRepository\<nvidia-
 | `EEVEE_PT_DEBUG_VIEW=<n>` | 输出 debug 通道 |
 | `EEVEE_PT_DEBUG_MOTION=1` | 在 TAA 阶段输出 motion 可视化 |
 | `EEVEE_PT_DEBUG_FLAGS=8` | 把 motion 强制清零，用于隔离重投影问题 |
+| `EEVEE_PT_NRD_VALIDATE=1` | NRD validation 覆盖层（等价勾选面板里的 `NRD Validation`） |
+
+NRD validation 覆盖层的开关在 Raytracing 面板的 `Channels → NRD Validation`（场景属性 `pathtracing_use_validation`），默认关闭；上面的环境变量是给自动化测试用的 override，两者任一为真即开启。它显示的是 NRD 的**历史健康度染色**（见 NRD `OUT_VALIDATION`），不是图像内容通道，可叠加在任意 Debug View 之上。
+
+Debug View（`pathtracing_debug_view` / `EEVEE_PT_DEBUG_VIEW`）现在是**单帧直通**的：TAA 阶段不再对 debug 通道做时间累积，Raw / Hit Distance 等视图显示的就是当帧原始信号；切回 `Composite` 时 TAA 历史会干净重启。
 
 `EEVEE_PT_DEBUG_VIEW` 主要取值：
 
