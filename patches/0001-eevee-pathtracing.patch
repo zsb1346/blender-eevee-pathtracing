@@ -366,10 +366,10 @@ index a1d6493d..7a73ba82 100644
    bool uses_render_border() const final
 diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing.cc b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
 new file mode 100644
-index 00000000..d4353dd2
+index 00000000..af75ef5a
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,863 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -385,6 +385,7 @@ index 00000000..d4353dd2
 +#include <cstdlib>
 +
 +#include "BKE_attribute.hh"
++#include "BKE_light.h"
 +#include "BKE_material.hh"
 +#include "DEG_depsgraph_query.hh"
 +#include "BKE_mesh.hh"
@@ -589,6 +590,10 @@ index 00000000..d4353dd2
 +
 +void PathTracingModule::light_sync(draw::ObjectRef &ob_ref)
 +{
++  if (!inst_.use_scene_lights()) {
++    return;
++  }
++
 +  const blender::Light *light = reinterpret_cast<const blender::Light *>(ob_ref.object->data);
 +  if (light == nullptr) {
 +    return;
@@ -614,23 +619,42 @@ index 00000000..d4353dd2
 +                                       scale_y,
 +                                   0.003f);
 +  const float radius = is_area ? 0.0f : max_ff(light->radius, 0.001f);
-+  /* The path tracer uses spot_flags.z for the sun's angular radius (tan of half the angular
-+   * diameter), needed by the SIGMA penumbra estimate. */
 +  const float sun_angle = (light->type == LA_SUN && light->sun_angle > 0.0f) ?
 +                              light->sun_angle :
 +                              DEG2RADF(0.526f);
 +  const float tan_sun_radius = tanf(sun_angle * 0.5f);
 +
++  const float3 light_color = BKE_light_color(*light);
++  float light_power = BKE_light_power(*light);
++  if (light->mode & LA_UNNORMALIZED) {
++    light_power *= BKE_light_area(*light, object_to_world);
++  }
++
++  float custom_att_inv_sqr = 0.0f;
++  if (light->type != LA_SUN && (light->mode & LA_CUSTOM_ATTENUATION) != 0) {
++    custom_att_inv_sqr = (light->att_dist > 1e-6f) ?
++                             (1.0f / (light->att_dist * light->att_dist)) :
++                             1.0e12f;
++  }
++
++  const bool diffuse_vis = (ob_ref.object->visibility_flag & OB_HIDE_DIFFUSE) == 0;
++  const bool glossy_vis = (ob_ref.object->visibility_flag & OB_HIDE_GLOSSY) == 0;
++  const bool transmission_vis = (ob_ref.object->visibility_flag & OB_HIDE_TRANSMISSION) == 0;
++
 +  LightRecord record = {};
 +  record.position_type = float4(position, float(light->type));
-+  record.direction_power = float4(forward, light->energy);
-+  record.color_radius = float4(light->r, light->g, light->b, radius);
++  record.direction_power = float4(forward, light_power);
++  record.color_radius = float4(light_color, radius);
 +  record.spot_flags = float4(light->spotsize,
 +                             light->spotblend,
 +                             light->type == LA_SUN ? tan_sun_radius : area_size_x,
 +                             area_size_y);
 +  record.area_right = float4(area_right, float(light->area_shape));
-+  record.area_up = float4(area_up, 0.0f);
++  record.area_up = float4(area_up, custom_att_inv_sqr);
++  record.influence_shadow = float4(light->diff_fac * float(diffuse_vis),
++                                   light->spec_fac * float(glossy_vis),
++                                   (light->mode & LA_SHADOW) ? 1.0f : 0.0f,
++                                   light->transmission_fac * float(transmission_vis));
 +  lights_.append(record);
 +}
 +
@@ -1091,7 +1115,7 @@ index 00000000..d4353dd2
 +    nrd_input.shadow_output = inst_.render_buffers.nrd_shadow_output_tx;
 +    nrd_input.has_sun = false;
 +    for (const LightRecord &light : lights_) {
-+      if (uint(light.position_type.w) == 1u) {
++      if (uint(light.position_type.w) == 1u && light.influence_shadow.z > 0.5f) {
 +        const float3 to_sun = float3(-light.direction_power.x,
 +                                     -light.direction_power.y,
 +                                     -light.direction_power.z);
@@ -1377,10 +1401,10 @@ index 00000000..9e5845c3
 +}  // namespace blender::eevee
 diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh b/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh
 new file mode 100644
-index 00000000..8216a740
+index 00000000..e74d7519
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/eevee_pathtracing_shared.hh
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,122 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -1486,21 +1510,47 @@ index 00000000..8216a740
 +struct [[host_shared]] LightRecord {
 +  /* xyz = world position, w = light type (eLightType). */
 +  float4 position_type;
-+  /* xyz = world forward direction, w = power / sun strength. */
++  /* xyz = world forward direction, w = power (with exposure & normalize applied). */
 +  float4 direction_power;
-+  /* rgb = light color, a = point/spot radius. */
++  /* rgb = light color (including temperature), a = point/spot radius. */
 +  float4 color_radius;
-+  /* x = spot size, y = spot blend, z = area size X, w = area size Y. */
++  /* x = spot size, y = spot blend, z = area size X (or tan_sun_radius), w = area size Y. */
 +  float4 spot_flags;
 +  /* xyz = area light local X axis in world, w = eLightAreaShape. */
 +  float4 area_right;
-+  /* xyz = area light local Y axis in world, w = pad. */
++  /* xyz = area light local Y axis in world, w = custom_attenuation_inv_sqr (0 = unlimited). */
 +  float4 area_up;
++  /* x = diff_fac, y = spec_fac, z = cast_shadow (0/1), w = transmission_fac. */
++  float4 influence_shadow;
 +};
 +
 +#ifndef GPU_SHADER
 +}  // namespace blender::eevee
 +#endif
+diff --git a/source/blender/draw/engines/eevee/eevee_pipeline.cc b/source/blender/draw/engines/eevee/eevee_pipeline.cc
+index ac8fed5e..e565ae3a 100644
+--- a/source/blender/draw/engines/eevee/eevee_pipeline.cc
++++ b/source/blender/draw/engines/eevee/eevee_pipeline.cc
+@@ -1090,7 +1090,7 @@ gpu::Texture *DeferredLayer::render(View &render_view,
+   constexpr eGPUTextureUsage usage_write = GPU_TEXTURE_USAGE_SHADER_WRITE;
+   constexpr eGPUTextureUsage usage_rw = usage_read | usage_write;
+ 
+-  if (use_screen_transmission_) {
++  if (!inst_.path_tracing.enabled() && use_screen_transmission_) {
+     /* Update for refraction. */
+     inst_.hiz_buffer.update();
+   }
+@@ -1104,6 +1104,10 @@ gpu::Texture *DeferredLayer::render(View &render_view,
+     inst_.manager->submit(clear_aovs_ps_);
+   }
+ 
++  if (inst_.path_tracing.enabled()) {
++    return nullptr;
++  }
++
+   inst_.hiz_buffer.swap_layer();
+   /* Update for lighting pass or AO node. */
+   inst_.hiz_buffer.update();
 diff --git a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
 index ca9abfbd..135dbe42 100644
 --- a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
@@ -1611,10 +1661,45 @@ index 0c41a9ac..9b2a7edc 100644
  
    if (inst_.is_image_render) {
 diff --git a/source/blender/draw/engines/eevee/eevee_view.cc b/source/blender/draw/engines/eevee/eevee_view.cc
-index 67126e73..ff22d020 100644
+index 67126e73..4ea1cf55 100644
 --- a/source/blender/draw/engines/eevee/eevee_view.cc
 +++ b/source/blender/draw/engines/eevee/eevee_view.cc
-@@ -136,14 +136,22 @@ void ShadingView::render()
+@@ -109,18 +109,22 @@ void ShadingView::render()
+       with_raycast ? GPU_ATTACHMENT_TEXTURE(rbufs.object_id_tx) : GPU_ATTACHMENT_NONE,
+       GPU_ATTACHMENT_TEXTURE(rbufs.vector_tx));
+ 
+-  GBuffer &gbuf = inst_.gbuffer;
+-  gbuf.acquire(extent_,
+-               inst_.pipelines.deferred.header_layer_count(),
+-               inst_.pipelines.deferred.closure_layer_count(),
+-               inst_.pipelines.deferred.normal_layer_count());
+-
+-  gbuffer_fb_.ensure(GPU_ATTACHMENT_TEXTURE(rbufs.depth_tx),
+-                     GPU_ATTACHMENT_TEXTURE(rbufs.combined_tx),
+-                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.header_tx.layer_view(0), 0),
+-                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.normal_tx.layer_view(0), 0),
+-                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(0), 0),
+-                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(1), 0));
++  const bool pt_enabled = inst_.path_tracing.enabled();
++
++  if (!pt_enabled) {
++    GBuffer &gbuf = inst_.gbuffer;
++    gbuf.acquire(extent_,
++                 inst_.pipelines.deferred.header_layer_count(),
++                 inst_.pipelines.deferred.closure_layer_count(),
++                 inst_.pipelines.deferred.normal_layer_count());
++
++    gbuffer_fb_.ensure(GPU_ATTACHMENT_TEXTURE(rbufs.depth_tx),
++                       GPU_ATTACHMENT_TEXTURE(rbufs.combined_tx),
++                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.header_tx.layer_view(0), 0),
++                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.normal_tx.layer_view(0), 0),
++                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(0), 0),
++                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(1), 0));
++  }
+ 
+   /* If camera has any motion, compute motion vector in the film pass. Otherwise, we avoid float
+    * precision issue by setting the motion of all static geometry to 0. */
+@@ -136,14 +140,21 @@ void ShadingView::render()
    /* Alpha stores transmittance. So start at 1. */
    GPU_framebuffer_clear_color_depth(
        combined_fb_, {0.0, 0.0, 0.0, 1.0}, inst_.film.depth.clear_value);
@@ -1622,7 +1707,6 @@ index 67126e73..ff22d020 100644
 +  /* Path Tracing replaces the traditional raster shading. Skip the empty background/volume/
 +   * AO/forward passes and the debug overlays. The deferred prepass still runs below so the
 +   * depth buffer (used by viewport grids and the orange selection outline) stays correct. */
-+  const bool pt_enabled = inst_.path_tracing.enabled();
 +  if (!pt_enabled) {
 +    inst_.pipelines.background.clear(render_view_);
 +  }
@@ -1639,7 +1723,7 @@ index 67126e73..ff22d020 100644
  
    inst_.pipelines.deferred.render(main_view_,
                                    render_view_,
-@@ -154,30 +162,39 @@ void ShadingView::render()
+@@ -154,30 +165,41 @@ void ShadingView::render()
                                    rt_buffer_opaque_,
                                    rt_buffer_refract_);
  
@@ -1647,27 +1731,30 @@ index 67126e73..ff22d020 100644
 +  if (!pt_enabled) {
 +    inst_.pipelines.background.render(render_view_, combined_fb_);
 +  }
++
++  if (!pt_enabled) {
++    inst_.gbuffer.release();
++  }
  
-   inst_.gbuffer.release();
- 
--  inst_.volume.draw_compute(main_view_, extent_);
+-  inst_.gbuffer.release();
 +  if (!pt_enabled) {
 +    inst_.volume.draw_compute(main_view_, extent_);
  
--  inst_.volume.draw_resolve(main_view_);
+-  inst_.volume.draw_compute(main_view_, extent_);
 +    inst_.volume.draw_resolve(main_view_);
  
--  inst_.ambient_occlusion.render_pass(render_view_);
+-  inst_.volume.draw_resolve(main_view_);
 +    inst_.ambient_occlusion.render_pass(render_view_);
  
--  inst_.pipelines.forward.render(
--      render_view_, rbufs.depth_tx, prepass_fb_, transparent_fb_, combined_fb_, extent_);
+-  inst_.ambient_occlusion.render_pass(render_view_);
 +    inst_.pipelines.forward.render(
 +        render_view_, rbufs.depth_tx, prepass_fb_, transparent_fb_, combined_fb_, extent_);
  
--  inst_.lights.shape_display_draw(render_view_, combined_fb_);
+-  inst_.pipelines.forward.render(
+-      render_view_, rbufs.depth_tx, prepass_fb_, transparent_fb_, combined_fb_, extent_);
 +    inst_.lights.shape_display_draw(render_view_, combined_fb_);
-+
+ 
+-  inst_.lights.shape_display_draw(render_view_, combined_fb_);
 +    inst_.lights.debug_draw(render_view_, combined_fb_);
 +    inst_.hiz_buffer.debug_draw(render_view_, combined_fb_);
 +    inst_.shadows.debug_draw(render_view_, combined_fb_);
@@ -1693,7 +1780,7 @@ index 67126e73..ff22d020 100644
  
    rbufs.release();
    postfx_tx_.release();
-@@ -273,7 +290,8 @@ void ShadingView::update_view()
+@@ -273,7 +295,8 @@ void ShadingView::update_view()
    }
  
    /* Anti-Aliasing / Super-Sampling jitter. */
@@ -1942,10 +2029,10 @@ index 00000000..e14da043
 +}  // namespace eevee::pathtracing
 diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
 new file mode 100644
-index 00000000..6ba21de1
+index 00000000..4f0a3eab
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
-@@ -0,0 +1,1330 @@
+@@ -0,0 +1,1417 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -2232,6 +2319,31 @@ index 00000000..6ba21de1
 +  return 4.0f * half_size.x * half_size.y;
 +}
 +
++float light_custom_attenuation(float dist, float inv_sqr_influence)
++{
++  if (inv_sqr_influence <= 0.0f) {
++    return 1.0f;
++  }
++  const float factor = dist * dist * inv_sqr_influence;
++  const float fac = saturate(1.0f - factor * factor);
++  return fac * fac;
++}
++
++float3 sample_light_disk_position(
++    float3 center, float3 to_light_dir, float radius, float u1, float u2)
++{
++  if (radius <= 1e-4f) {
++    return center;
++  }
++  const float3 up = abs(to_light_dir.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) :
++                                                   float3(1.0f, 0.0f, 0.0f);
++  const float3 tangent = safe_normalize(cross(up, to_light_dir), float3(1.0f, 0.0f, 0.0f));
++  const float3 bitangent = cross(to_light_dir, tangent);
++  const float r = sqrt(u1) * radius;
++  const float phi = 2.0f * 3.14159265358979323846f * u2;
++  return center + tangent * (r * cos(phi)) + bitangent * (r * sin(phi));
++}
++
 +/* Approximation from "Ray Tracing Gems" chapter 32, identical to NRD's environment term. */
 +float3 nrd_environment_term(float3 rf0, float no_v, float roughness)
 +{
@@ -2416,6 +2528,8 @@ index 00000000..6ba21de1
 +  float3 spec_radiance = float3(0.0f);
 +  float3 direct_radiance = float3(0.0f);
 +  float3 sun_direct_radiance = float3(0.0f);
++  float3 local_direct_diff = float3(0.0f);
++  float3 local_direct_spec = float3(0.0f);
 +  bool has_sun = false;
 +  float3 sun_direction = float3(0.0f, 0.0f, 1.0f);
 +  float tan_sun_radius = 0.0f;
@@ -2553,20 +2667,29 @@ index 00000000..6ba21de1
 +      diff_radiance = background_radiance;
 +    }
 +  }
-+  else {
++else {
 +    /* --------------------------------------------------------
-+     * 2. Primary direct lighting (1 sample per light; TAA/NRD accumulates over frames).
++     * 2. Primary direct lighting:
++     *    - Sun (type 1) stays in direct_radiance (denoised by SIGMA if shadow enabled).
++     *    - Local lights (Point/Spot/Area) go into local_direct_diff/spec (denoised by REBLUR),
++     *      with Power-Heuristic MIS for area-light specular.
 +     * -------------------------------------------------------- */
 +    for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
 +      const LightRecord light = srt.light_buf[light_id];
 +      const uint light_type = uint(light.position_type.w);
-+      const bool use_bsdf_spec = (debug_flags & 4u) == 0u && p_roughness < 0.35f &&
-+                                 light_type == 4u;
++      const float diff_fac = light.influence_shadow.x;
++      const float spec_fac = light.influence_shadow.y;
++      const bool cast_shadow = light.influence_shadow.z > 0.5f;
++      if (diff_fac <= 0.0f && spec_fac <= 0.0f) {
++        continue;
++      }
 +
 +      float3 light_position = light.position_type.xyz;
 +      float3 wi;
 +      float3 irradiance;
 +      float shadow_distance;
++      float pdf_light_w = 0.0f;
++      bool is_area_light = false;
 +
 +      if (light_type == 1u) {
 +        wi = safe_normalize(-light.direction_power.xyz, float3(0.0f, 0.0f, 1.0f));
@@ -2574,6 +2697,7 @@ index 00000000..6ba21de1
 +        shadow_distance = 1e30f;
 +      }
 +      else if (light_type == 4u) {
++        is_area_light = true;
 +        const uint area_shape = uint(light.area_right.w);
 +        const float2 half_size = float2(light.spot_flags.z, light.spot_flags.w) * 0.5f;
 +        const float2 uv = float2(rng.next(), rng.next());
@@ -2596,28 +2720,53 @@ index 00000000..6ba21de1
 +        const float3 to_light = light_position - primary_hit_position;
 +        const float distance_sq = dot(to_light, to_light);
 +        const float distance = sqrt(distance_sq);
++        const float custom_att = light_custom_attenuation(distance, light.area_up.w);
++        if (custom_att <= 0.0f) {
++          continue;
++        }
 +        wi = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
 +        const float cos_light = saturate(dot(-wi, light.direction_power.xyz));
 +        if (cos_light <= 0.0f) {
 +          continue;
 +        }
-+        irradiance = light.color_radius.rgb * light.direction_power.w * cos_light /
++        const float area = max(area_light_area(light), 1e-6f);
++        pdf_light_w = distance_sq / max(area * cos_light, 1e-6f);
++        irradiance = light.color_radius.rgb * light.direction_power.w * cos_light * custom_att /
 +                     max(3.14159265358979323846f * distance_sq, 1e-3f);
 +        shadow_distance = distance;
 +      }
 +      else {
-+        const float3 to_light = light.position_type.xyz - primary_hit_position;
++        const float3 to_center = light.position_type.xyz - primary_hit_position;
++        const float center_dist_sq = dot(to_center, to_center);
++        const float center_dist = sqrt(center_dist_sq);
++        const float custom_att = light_custom_attenuation(center_dist, light.area_up.w);
++        if (custom_att <= 0.0f) {
++          continue;
++        }
++        const float light_radius = light.color_radius.a;
++        const float3 center_dir = safe_normalize(to_center, float3(0.0f, 0.0f, 1.0f));
++        const float3 sample_pos = (cast_shadow && center_dist > light_radius) ?
++                                      sample_light_disk_position(light.position_type.xyz,
++                                                                 center_dir,
++                                                                 light_radius,
++                                                                 rng.next(),
++                                                                 rng.next()) :
++                                      light.position_type.xyz;
++        const float3 to_light = sample_pos - primary_hit_position;
 +        const float distance_sq = dot(to_light, to_light);
 +        const float distance = sqrt(distance_sq);
 +        wi = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
-+        const float min_distance_sq = max(light.color_radius.a * light.color_radius.a, 1e-4f);
-+        irradiance = light.color_radius.rgb * light.direction_power.w /
-+                     max(4.0f * 3.14159265358979323846f * max(distance_sq, min_distance_sq),
-+                         1e-3f);
++
++        const float r_sqr = light_radius * light_radius;
++        const float falloff = 2.0f / max(center_dist_sq + r_sqr +
++                                             center_dist * sqrt(center_dist_sq + r_sqr),
++                                         1e-4f);
++        irradiance = light.color_radius.rgb * light.direction_power.w * custom_att * falloff /
++                     (4.0f * 3.14159265358979323846f);
 +        shadow_distance = distance;
 +
 +        if (light_type == 2u) {
-+          const float cos_angle = dot(-wi, light.direction_power.xyz);
++          const float cos_angle = dot(-center_dir, light.direction_power.xyz);
 +          const float outer_angle = light.spot_flags.x * 0.5f;
 +          const float inner_angle = outer_angle * (1.0f - light.spot_flags.y);
 +          const float cos_outer = cos(outer_angle);
@@ -2625,7 +2774,8 @@ index 00000000..6ba21de1
 +          if (cos_angle < cos_outer) {
 +            continue;
 +          }
-+          const float spot = saturate((cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-5f));
++          const float spot = smoothstep(
++              0.0f, 1.0f, (cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-5f));
 +          irradiance *= spot;
 +        }
 +      }
@@ -2635,7 +2785,7 @@ index 00000000..6ba21de1
 +        continue;
 +      }
 +
-+      if (light_type != 1u) {
++      if (light_type != 1u && cast_shadow) {
 +        rayQuery shadow_query;
 +        rayQueryInitialize(shadow_query,
 +                           srt.scene_as,
@@ -2665,8 +2815,17 @@ index 00000000..6ba21de1
 +      const float3 specular = (distribution * geometry) * fresnel /
 +                              max(4.0f * ndotl * p_ndotv, 1e-4f);
 +
-+      float3 direct_diffuse = irradiance * ndotl * p_diffuse_color * inv_pi * (1.0f - fresnel);
-+      float3 direct_specular = use_bsdf_spec ? float3(0.0f) : (irradiance * ndotl * specular);
++      float mis_spec_weight = 1.0f;
++      if (is_area_light && (debug_flags & 4u) == 0u) {
++        const float pdf_bsdf_w = distribution * ndoth / max(4.0f * vdoth, 1e-6f);
++        const float w_l = pdf_light_w * pdf_light_w;
++        const float w_b = pdf_bsdf_w * pdf_bsdf_w;
++        mis_spec_weight = w_l / max(w_l + w_b, 1e-12f);
++      }
++
++      const float3 direct_diffuse = irradiance * ndotl * p_diffuse_color * inv_pi *
++                                    (1.0f - fresnel) * diff_fac;
++      const float3 direct_specular = irradiance * ndotl * specular * mis_spec_weight * spec_fac;
 +      const float3 diffuse_contribution = clamp_radiance_luminance_preserving(
 +          direct_diffuse, srt.pathtracing_data.clamp_direct);
 +      const float3 specular_contribution = clamp_radiance_luminance_preserving(
@@ -2674,27 +2833,23 @@ index 00000000..6ba21de1
 +      if (valid_radiance(diffuse_contribution) && valid_radiance(specular_contribution)) {
 +        if (light_type == 1u) {
 +          direct_radiance += diffuse_contribution + specular_contribution;
-+          sun_direct_radiance += diffuse_contribution + specular_contribution;
-+          if (!has_sun) {
-+            has_sun = true;
-+            sun_direction = wi;
-+            tan_sun_radius = light.spot_flags.z;
++          if (cast_shadow) {
++            sun_direct_radiance += diffuse_contribution + specular_contribution;
++            if (!has_sun) {
++              has_sun = true;
++              sun_direction = wi;
++              tan_sun_radius = light.spot_flags.z;
++            }
 +          }
 +        }
 +        else {
-+          direct_radiance += diffuse_contribution;
-+          if (p_roughness < 0.35f) {
-+            direct_radiance += specular_contribution;
-+          }
-+          else {
-+            spec_radiance += specular_contribution;
-+          }
++          local_direct_diff += diffuse_contribution;
++          local_direct_spec += specular_contribution;
 +        }
 +      }
 +    }
 +
-+    /* Sun-disc visibility ray for SIGMA. The nearest hit distance (or infinity) is packed for
-+     * the denoised shadow. NRD forbids terminate-first-hit for penumbra rays, so use no flag. */
++    /* Sun-disc visibility ray for SIGMA. */
 +    if (has_sun && tan_sun_radius > 0.0f) {
 +      const float3 up = abs(sun_direction.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) :
 +                                                        float3(1.0f, 0.0f, 0.0f);
@@ -2724,19 +2879,18 @@ index 00000000..6ba21de1
 +      }
 +    }
 +
-+    /* BSDF-sampled direct specular for smooth surfaces and area lights (1 sample). */
-+    if ((debug_flags & 4u) == 0u && p_roughness < 0.35f) {
++    /* BSDF-sampled direct specular with Power-Heuristic MIS for area lights -> REBLUR. */
++    if ((debug_flags & 4u) == 0u) {
 +      for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
 +        const LightRecord light = srt.light_buf[light_id];
-+        if (uint(light.position_type.w) != 4u) {
++        const float spec_fac = light.influence_shadow.y;
++        if (uint(light.position_type.w) != 4u || spec_fac <= 0.0f) {
 +          continue;
 +        }
 +        const float area = area_light_area(light);
 +        if (area <= 1e-6f) {
 +          continue;
 +        }
-+        const float3 radiance_light = light.color_radius.rgb * light.direction_power.w /
-+                                      (area * 3.14159265358979323846f);
 +        const float3 half_vector = sample_ggx_half_vector(
 +            rng.next(), rng.next(), p_normal, p_alpha2);
 +        const float3 wi_bsdf = reflect(primary_ray_direction, half_vector);
@@ -2756,39 +2910,58 @@ index 00000000..6ba21de1
 +        {
 +          continue;
 +        }
-+        if (dot(-wi_bsdf, light.direction_power.xyz) <= 0.0f) {
++        const float custom_att = light_custom_attenuation(light_distance, light.area_up.w);
++        if (custom_att <= 0.0f) {
 +          continue;
 +        }
-+        rayQuery shadow_query;
-+        rayQueryInitialize(shadow_query,
-+                           srt.scene_as,
-+                           gpu_RayFlagsTerminateOnFirstHit,
-+                           0xFFu,
-+                           primary_hit_position + p_offset_normal * p_ray_epsilon,
-+                           p_ray_epsilon,
-+                           wi_bsdf,
-+                           max(light_distance - p_ray_epsilon, 0.0f));
-+        while (rayQueryProceed(shadow_query)) {
-+        }
-+        if (rayQueryGetIntersectionType(shadow_query, true) !=
-+            gpu_RayQueryCommittedIntersectionNone)
-+        {
++        const float cos_light = dot(-wi_bsdf, light.direction_power.xyz);
++        if (cos_light <= 0.0f) {
 +          continue;
 +        }
++        if (light.influence_shadow.z > 0.5f) {
++          rayQuery shadow_query;
++          rayQueryInitialize(shadow_query,
++                             srt.scene_as,
++                             gpu_RayFlagsTerminateOnFirstHit,
++                             0xFFu,
++                             primary_hit_position + p_offset_normal * p_ray_epsilon,
++                             p_ray_epsilon,
++                             wi_bsdf,
++                             max(light_distance - p_ray_epsilon, 0.0f));
++          while (rayQueryProceed(shadow_query)) {
++          }
++          if (rayQueryGetIntersectionType(shadow_query, true) !=
++              gpu_RayQueryCommittedIntersectionNone)
++          {
++            continue;
++          }
++        }
++        const float pdf_bsdf_w = ggx_distribution(ndoth, p_alpha2) * ndoth /
++                                 max(4.0f * vdoth, 1e-6f);
++        const float pdf_light_w = (light_distance * light_distance) /
++                                  max(area * cos_light, 1e-6f);
++        const float w_b = pdf_bsdf_w * pdf_bsdf_w;
++        const float w_l = pdf_light_w * pdf_light_w;
++        const float mis_bsdf_weight = w_b / max(w_b + w_l, 1e-12f);
++
++        const float3 radiance_light = light.color_radius.rgb * light.direction_power.w *
++                                      custom_att / (area * 3.14159265358979323846f);
 +        const float3 fresnel = fresnel_schlick(p_f0, vdoth);
 +        const float geometry = smith_g1(p_ndotv, p_alpha2) * smith_g1(ndotl, p_alpha2);
 +        const float3 specular_weight = geometry * fresnel * vdoth /
 +                                       max(p_ndotv * ndoth, 1e-4f);
 +        const float3 contribution = clamp_radiance_luminance_preserving(
-+            specular_weight * radiance_light, srt.pathtracing_data.clamp_direct);
++            specular_weight * radiance_light * mis_bsdf_weight * spec_fac,
++            srt.pathtracing_data.clamp_direct);
 +        if (valid_radiance(contribution)) {
-+          direct_radiance += contribution;
++          local_direct_spec += contribution;
 +        }
 +      }
 +    }
 +
 +    /* --------------------------------------------------------
-+     * 3. Indirect diffuse & specular lobes starting from bounce = 1.
++     * 3. Indirect diffuse & specular lobes starting from bounce = 1
++     *    (with energy-conserving (1 - F_env) diffuse & height-correlated G2).
 +     * -------------------------------------------------------- */
 +    for (uint lobe = 0u; lobe < 2u; lobe++) {
 +      const bool primary_specular = (lobe == 1u);
@@ -2808,8 +2981,8 @@ index 00000000..6ba21de1
 +      }
 +      else {
 +        wi0 = sample_cosine_hemisphere(rng.next(), rng.next(), p_normal);
-+        const float3 f_env = nrd_environment_term(p_f0, p_ndotv, p_roughness);
-+        brdf_weight0 = p_diffuse_color * (float3(1.0f) - f_env);
++        const float3 f_env0 = nrd_environment_term(p_f0, p_ndotv, p_roughness);
++        brdf_weight0 = p_diffuse_color * (float3(1.0f) - f_env0);
 +      }
 +
 +      float3 throughput = min(brdf_weight0, float3(100.0f));
@@ -2959,10 +3132,17 @@ index 00000000..6ba21de1
 +          }
 +        }
 +
-+        /* Indirect direct lighting (1 sample per light). */
++        /* Indirect direct lighting (1 sample per light, with light flags/attenuation). */
 +        for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
 +          const LightRecord light = srt.light_buf[light_id];
 +          const uint light_type = uint(light.position_type.w);
++          const float diff_fac = light.influence_shadow.x;
++          const float spec_fac = light.influence_shadow.y;
++          const bool cast_shadow = light.influence_shadow.z > 0.5f;
++          if (diff_fac <= 0.0f && spec_fac <= 0.0f) {
++            continue;
++          }
++
 +          float3 light_position = light.position_type.xyz;
 +          float3 wi_l;
 +          float3 irradiance;
@@ -2995,24 +3175,34 @@ index 00000000..6ba21de1
 +            const float3 to_light = light_position - hit_position;
 +            const float distance_sq = dot(to_light, to_light);
 +            const float distance = sqrt(distance_sq);
++            const float custom_att = light_custom_attenuation(distance, light.area_up.w);
++            if (custom_att <= 0.0f) {
++              continue;
++            }
 +            wi_l = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
 +            const float cos_light = saturate(dot(-wi_l, light.direction_power.xyz));
 +            if (cos_light <= 0.0f) {
 +              continue;
 +            }
-+            irradiance = light.color_radius.rgb * light.direction_power.w * cos_light /
-+                         max(3.14159265358979323846f * distance_sq, 1e-3f);
++            irradiance = light.color_radius.rgb * light.direction_power.w * cos_light *
++                         custom_att / max(3.14159265358979323846f * distance_sq, 1e-3f);
 +            shadow_distance = distance;
 +          }
 +          else {
 +            const float3 to_light = light.position_type.xyz - hit_position;
 +            const float distance_sq = dot(to_light, to_light);
 +            const float distance = sqrt(distance_sq);
++            const float custom_att = light_custom_attenuation(distance, light.area_up.w);
++            if (custom_att <= 0.0f) {
++              continue;
++            }
 +            wi_l = safe_normalize(to_light, float3(0.0f, 0.0f, 1.0f));
-+            const float min_distance_sq = max(light.color_radius.a * light.color_radius.a, 1e-4f);
-+            irradiance = light.color_radius.rgb * light.direction_power.w /
-+                         max(4.0f * 3.14159265358979323846f * max(distance_sq, min_distance_sq),
-+                             1e-3f);
++            const float r_sqr = light.color_radius.a * light.color_radius.a;
++            const float falloff = 2.0f / max(distance_sq + r_sqr +
++                                                 distance * sqrt(distance_sq + r_sqr),
++                                             1e-4f);
++            irradiance = light.color_radius.rgb * light.direction_power.w * custom_att * falloff /
++                         (4.0f * 3.14159265358979323846f);
 +            shadow_distance = distance;
 +            if (light_type == 2u) {
 +              const float cos_angle = dot(-wi_l, light.direction_power.xyz);
@@ -3023,7 +3213,8 @@ index 00000000..6ba21de1
 +              if (cos_angle < cos_outer) {
 +                continue;
 +              }
-+              irradiance *= saturate((cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-5f));
++              irradiance *= smoothstep(
++                  0.0f, 1.0f, (cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-5f));
 +            }
 +          }
 +
@@ -3032,21 +3223,23 @@ index 00000000..6ba21de1
 +            continue;
 +          }
 +
-+          rayQuery shadow_query;
-+          rayQueryInitialize(shadow_query,
-+                             srt.scene_as,
-+                             gpu_RayFlagsTerminateOnFirstHit,
-+                             0xFFu,
-+                             hit_position + offset_normal * ray_epsilon,
-+                             ray_epsilon,
-+                             wi_l,
-+                             max(shadow_distance - ray_epsilon, 0.0f));
-+          while (rayQueryProceed(shadow_query)) {
-+          }
-+          if (rayQueryGetIntersectionType(shadow_query, true) !=
-+              gpu_RayQueryCommittedIntersectionNone)
-+          {
-+            continue;
++          if (cast_shadow) {
++            rayQuery shadow_query;
++            rayQueryInitialize(shadow_query,
++                               srt.scene_as,
++                               gpu_RayFlagsTerminateOnFirstHit,
++                               0xFFu,
++                               hit_position + offset_normal * ray_epsilon,
++                               ray_epsilon,
++                               wi_l,
++                               max(shadow_distance - ray_epsilon, 0.0f));
++            while (rayQueryProceed(shadow_query)) {
++            }
++            if (rayQueryGetIntersectionType(shadow_query, true) !=
++                gpu_RayQueryCommittedIntersectionNone)
++            {
++              continue;
++            }
 +          }
 +
 +          const float3 h_vec = wi_l + wo;
@@ -3060,9 +3253,10 @@ index 00000000..6ba21de1
 +          const float3 specular = (distribution * geometry) * fresnel /
 +                                  max(4.0f * ndotl * ndotv, 1e-4f);
 +          const float3 direct_diffuse = irradiance * ndotl * diffuse_color * inv_pi *
-+                                        (1.0f - fresnel);
++                                        (1.0f - fresnel) * diff_fac;
++          const float3 direct_specular = irradiance * ndotl * specular * spec_fac;
 +          const float3 contribution = clamp_radiance_luminance_preserving(
-+              throughput * (direct_diffuse + irradiance * ndotl * specular),
++              throughput * (direct_diffuse + direct_specular),
 +              srt.pathtracing_data.clamp_indirect);
 +          if (valid_radiance(contribution)) {
 +            bounce_radiance += contribution;
@@ -3100,8 +3294,7 @@ index 00000000..6ba21de1
 +            break;
 +          }
 +          const float vdoth = saturate(dot(wo, half_vector));
-+          brdf_weight = fresnel_schlick(f0, vdoth) *
-+                        smith_g2_over_g1(ndotv, ndotl, alpha2) /
++          brdf_weight = fresnel_schlick(f0, vdoth) * smith_g2_over_g1(ndotv, ndotl, alpha2) /
 +                        max(1.0f - diffuse_probability, 1e-3f);
 +        }
 +        else {
@@ -3157,39 +3350,28 @@ index 00000000..6ba21de1
 +    }
 +  }
 +
-+  diff_radiance = valid_radiance(diff_radiance) ? max(diff_radiance, float3(0.0f)) :
++diff_radiance = valid_radiance(diff_radiance) ? max(diff_radiance, float3(0.0f)) :
 +                                                  float3(0.0f);
 +  spec_radiance = valid_radiance(spec_radiance) ? max(spec_radiance, float3(0.0f)) :
 +                                                  float3(0.0f);
 +  direct_radiance = valid_radiance(direct_radiance) ? direct_radiance : float3(0.0f);
-+  /* USE_MOVING_EMISSION_FIX: feed a small energy-conserving fraction of primary emission
-+   * through both denoised channels so an animated emitter cannot leave a dark tail. The
-+   * remainder stays in the sharp DirectEmission channel added by the composite pass.
-+   *
-+   * IMPORTANT: NRD-Sample adds this proxy to the DEMODULATED radiance
-+   * (TraceOpaque.cs.hlsl: `demodulatedRadiance += materialProps0.Lemi / Pi(2)`). It must NOT be
-+   * added to the modulated signal here, because the `1 / diff_factor` demodulation below would
-+   * then amplify it up to 50x on a dark-colored emitter (factor min 0.02). REBLUR spatially
-+   * smears that inflated chroma into the neighboring floor as a pink haze. The proxy is added
-+   * to the demodulated NRD input a few lines down instead. Keep `radiance`/frag_out consistent
-+   * by adding the 2x proxy back explicitly here (energy conservation vs DirectEmission). */
++  local_direct_diff = valid_radiance(local_direct_diff) ? max(local_direct_diff, float3(0.0f)) :
++                                                          float3(0.0f);
++  local_direct_spec = valid_radiance(local_direct_spec) ? max(local_direct_spec, float3(0.0f)) :
++                                                          float3(0.0f);
++
 +  const float3 emission_proxy = primary_emission / (2.0f * 3.14159265358979323846f);
 +  primary_emission = max(primary_emission - 2.0f * emission_proxy, float3(0.0f));
-+  /* Final safety clamp on the indirect signal. Use the UI's "clamp indirect" value so it has a
-+   * real effect on the denoiser input; a hard-coded 1000 let red fireflies through. clamp <= 0
-+   * means "no clamp" (see clamp_radiance_luminance_preserving). */
++
 +  const float indirect_clamp = srt.pathtracing_data.clamp_indirect;
++  const float direct_clamp = srt.pathtracing_data.clamp_direct;
 +  diff_radiance = clamp_radiance_luminance_preserving(diff_radiance, indirect_clamp);
 +  spec_radiance = clamp_radiance_luminance_preserving(spec_radiance, indirect_clamp);
-+  /* The 2x emission proxy was moved out of diff/spec_radiance (see above); add it back so the
-+   * final combined image keeps exactly the same emission energy as before. */
-+  radiance = diff_radiance + spec_radiance + 2.0f * emission_proxy;
-+  /* EEVEE combined alpha stores transmittance (film converts with 1-alpha), so 0 = opaque. */
++
++  radiance = diff_radiance + local_direct_diff + spec_radiance + local_direct_spec +
++             2.0f * emission_proxy;
 +  frag_out.color = float4(radiance + direct_radiance, 0.0f);
 +
-+  /* NRD's compute shaders use a top-down origin (pixelPos.y == 0 is the top, ndc.y == +1),
-+   * while the fullscreen raster pass has frag_co.y == 0 at the bottom. Flip Y only for the
-+   * textures consumed by NRD; direct lighting and the auxiliary SSBO stay in raster space. */
 +  const int2 frag_texel = int2(frag_co.xy);
 +  const int2 nrd_texel = int2(frag_texel.x,
 +                              int(srt.pathtracing_data.resolution.y) - 1 - frag_texel.y);
@@ -3197,21 +3379,19 @@ index 00000000..6ba21de1
 +             nrd_texel,
 +             pack_normal_roughness(nrd_normal, nrd_roughness, nrd_material_id));
 +  imageStore(srt.out_viewz_img, nrd_texel, float4(nrd_viewz));
-+  /* Demodulate so the denoiser works on irradiance (NRD requirement). Factors are stored in
-+   * separate targets and re-applied in the composite pass. REBLUR additionally expects YCoCg
-+   * encoded radiance and a normalized hit distance in alpha. Both first-bounce lobes are
-+   * traced, so both channels carry their own hit distance. */
++
 +  const float diff_hit_distance = reblur_norm_hit_distance(diff_hitdist, nrd_viewz, 1.0f);
 +  const float spec_hit_distance = reblur_norm_hit_distance(spec_hitdist, nrd_viewz, nrd_roughness);
-+  /* Demodulate for NRD. The emission proxy is added HERE (after demodulation), matching
-+   * NRD-Sample's `demodulatedRadiance += Lemi / Pi(2)`. If it is added before demodulation the
-+   * `1 / diff_factor` (min 0.02) amplifies its chroma up to 50x and REBLUR smears a pink haze
-+   * across the neighboring floor. The UI's clamp_indirect bounds both the final image and the
-+   * denoiser input (clamp <= 0 disables it). */
++
 +  float3 denoised_diff_input = clamp_radiance_luminance_preserving(
 +      diff_radiance / diff_factor + emission_proxy, indirect_clamp);
++  denoised_diff_input += clamp_radiance_luminance_preserving(
++      local_direct_diff / diff_factor, direct_clamp);
 +  float3 denoised_spec_input = clamp_radiance_luminance_preserving(
 +      spec_radiance / spec_factor + emission_proxy, indirect_clamp);
++  denoised_spec_input += clamp_radiance_luminance_preserving(
++      local_direct_spec / spec_factor, direct_clamp);
++
 +  imageStore(srt.out_diffuse_img,
 +             nrd_texel,
 +             float4(linear_to_ycocg(denoised_diff_input), diff_hit_distance));
@@ -3239,10 +3419,6 @@ index 00000000..6ba21de1
 +  float2 nrd_motion = float2(0.0f);
 +  float nrd_motion_z = 0.0f;
 +  if (primary_hit) {
-+    /* NRD's 2.5D motion z (viewZprev - viewZ) must be provided even when the previous
-+     * position projects outside the screen: the disocclusion tests consume the view-Z
-+     * delta, and out-of-screen history is rejected independently by NRD's in-screen
-+     * check. Zeroing z here falsely reported "no camera motion" on camera dolly. */
 +    const float prev_viewz = (srt.pathtracing_data.prev_world_to_view *
 +                              float4(primary_prev_hit_position, 1.0f))
 +                                 .z;
@@ -3256,10 +3432,8 @@ index 00000000..6ba21de1
 +        project_screen_uv_unbounded(srt.pathtracing_data.curr_world_to_view,
 +                                    srt.pathtracing_data.curr_view_to_clip,
 +                                    primary_hit_position,
-+                                    curr_uv)) {
-+      /* Both current and previous hit points are projected with un-jittered matrices, so no
-+       * manual jitter delta is needed (matching NRD-Sample's GetMotion). Since the NRD input
-+       * textures are stored top-down (Y flipped), flip the Y component of the motion too. */
++                                    curr_uv))
++    {
 +      const float2 resolution_f = float2(srt.pathtracing_data.resolution);
 +      nrd_motion.x = (prev_uv.x - curr_uv.x) * resolution_f.x;
 +      nrd_motion.y = -(prev_uv.y - curr_uv.y) * resolution_f.y;
