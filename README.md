@@ -2,7 +2,7 @@
 
 在 Blender 5.3 EEVEE 中接入 Vulkan 硬件 ray query 的实时路径追踪原型，并使用 NRD 4.17.1 做降噪。
 
-> **状态：研究原型，未达到生产可用。** 2026-11-28 build25（当前补丁）为首交点接入 EEVEE 全材质节点系统后的稳定版本。已修复：视口红弧、间接光近 0 回归、SIGMA 硬阴影、视口 PT 被 `taa_samples` 截断、Debug View 时间累积污染、间接光溢出/青色条纹/点光 firefly/emission 解调、转视角历史被逐帧清空、运动矢量与历史键碰撞（红弧/满地红斑/viewport3 全黄的根因）、动态实例历史键、间接光越弹越亮、MV 屏幕边界历史误用，以及 build24c 切 PATH_TRACING 时 GBuffer 纹理提前 release 导致的崩溃。当前高速移动/旋转视角下 Viewport 3（MV 误差）全程纯黑，累积帧数轨迹与 NRD-Sample 一致。仍需多场景/多 GPU/不同分辨率复验。次级反弹材质、BLAS 索引映射等仍未完成；首交点已接入全材质节点系统（见下）。
+> **状态：研究原型，未达到生产可用。** 2026-11-28 build28（当前补丁）在 build25 首交点全材质节点基础上，加入玻璃阴影穿透、单光源随机抽样提速、次级玻璃折射，以及 HDRI 世界环境间接光（含 World 节点树解析、图片均值、NRD roughness 修复）和独立的 `NRD` 色彩管理 View（Uncharted2）。构建通过（0 errors / 0 warnings）。已修复：视口红弧、间接光近 0 回归、SIGMA 硬阴影、视口 PT 被 `taa_samples` 截断、Debug View 时间累积污染、间接光溢出/青色条纹/点光 firefly/emission 解调、转视角历史被逐帧清空、运动矢量与历史键碰撞、动态实例历史键、间接光越弹越亮、MV 屏幕边界历史误用、build24c GBuffer 提前 release 崩溃。仍需多场景/多 GPU/不同分辨率 GUI 复验；次级反弹材质、BLAS 索引映射等仍未完成。
 
 这个仓库只包含**源码补丁、文档、测试脚本和测试场景**，不包含完整 Blender 源码或构建产物。完整 Blender 工作区约 16 GB，不适合直接放进 Git 仓库。
 
@@ -27,6 +27,13 @@
 - 编辑模式自动回退普通 EEVEE，避免崩溃
 - NRD `OUT_VALIDATION` 覆盖层（诊断用）
 - 材质记录 dump（`pt_materials.json`）
+- 玻璃阴影穿透：全透射物体 `vis_mask=0x02`、阴影射线掩码 `0x01`、主 GI 射线保持 `0xFF`（玻璃可见可折射但不投黑影）
+- 单光源随机抽样：bounce≥1 直接光每反弹随机抽 1 盏灯并乘 `light_count` 保持无偏，多灯场景提速
+- 次级玻璃折射：Principled Transmission 走折射分支（Fresnel 反射/折射选择，`did_refract` 偏移光线起点）
+- HDRI 世界环境间接光：World 节点树解析（Environment Texture + Mapping Rotation + LightPath IsCameraRay），HDRI 降采样上传 GPU，次级反弹 miss 采样；主天空直读原生 `background.render` 输出
+- 完整材质节点求值：图片均值（16×16 网格，消除多反弹发白）、Mix/MixRGB/Add、ColorRamp/RGB/Invert/Gamma/BrightContrast/HueSat、Value 节点、贴图均值
+- NRD roughness 双 lobe：玻璃/透射用最锐利 lobe，修 NRD 虚拟视差
+- 独立 `NRD` 色彩管理 View：Uncharted2 tonemap（与 NRD-Sample 精确一致）+ sRGB，不改 PT 内部链路、不污染 NRD 输入/TAA 域
 
 ## 当前状态
 
@@ -41,9 +48,12 @@
 | Raytracing UI | 可用 |
 | 编辑模式 | 已修复 |
 | 首交点全材质节点系统 | build24/25 已接入：首交点走 EEVEE G-Buffer + 全材质节点求值（Principled/Mix/Diffuse/Glossy/Emission/Glass/Thin Glass/Translucent/SSS/Clearcoat，贴图/UDIM/ColorRamp/Noise/Voronoi/Bump/几何节点属性），省掉主相机 Ray Query；运动矢量优先用原生 `vector_tx`（骨骼/布料动态） |
-| 次级反弹材质 | 简化 MaterialRecord（Stage 1 定位，仅首交点接入全节点系统） |
-| transmission / emission / volume / hair | 首交点已覆盖 transmission/emission；volume / hair 未完成 |
+| 次级反弹材质 | build28：次级反射/折射走完整 MaterialRecord（含 transmission/ior）；贴图按图片均值代入，未逐 texel 采样 |
+| transmission / emission / volume / hair | 首交点和次级反弹均已覆盖 transmission/emission；volume / hair 未完成 |
 | DeferredLayer 着色分支 | build24：PT 模式下 prepass_add/material_add 折射并入 opaque_layer_，`DeferredLayer::render` 跑完 GBuffer 写入后提前返回（跳过阴影/SSRT/光照/SSS/Combine）；GBuffer release 推迟到 PT submit 之后 |
+| 玻璃阴影 / 折射 | build27/28：`vis_mask`+阴影掩码穿透、单光源抽样提速、次级玻璃折射、`nrd_roughness` 双 lobe |
+| HDRI 世界环境 | build28：World 节点树解析 + HDRI 上传 + 次级 bounce miss 采样；主天空直读原生世界渲染 |
+| 色彩管理 | build28：新增独立 `NRD` View（Uncharted2 SPI1D LUT），在 View 下拉切换，不改 PT 内部链路 |
 
 已知问题：
 
@@ -52,7 +62,7 @@
 - 金属 NRD 反射仍偏糊；BLAS 对原地 deform 的更新仍是 stale。
 - NRD/NRI/libxess 目前是 Windows 原型集成，尚未做成正式的可选模块。
 - Headless still 每次从 sample 0 开始，跨帧 TAA history 不连续；跨帧验证需要 GUI viewport 或多 redraw harness。
-- build25 只做了编译与启动验证（切 PATH_TRACING 不再崩溃），首交点贴图/玻璃/清漆的画质与实际帧率仍需多场景复验。
+- build25~28 只做了编译与启动验证（切 PATH_TRACING 不再崩溃），Bistro 发白/酒杯死黑/背面自发光/HDRI 间接光/玻璃阴影与帧率仍需 GUI 复验；NRD View 色调已做数值验证（LUT 逐点零误差、端到端 0/255 差），但未做主观观感复验。
 
 ## 快速开始
 
