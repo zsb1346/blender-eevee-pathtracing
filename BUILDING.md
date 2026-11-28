@@ -1,6 +1,6 @@
 # Building
 
-> 当前状态（2026-11-27）：本文构建步骤有效，当前稳定 exe 为 build18（`D:\build_windows_x64_vc17_Release\bin\Release\blender.exe`，MTIME `15:53:18`）。增量构建前须确认无 Blender 进程占用 exe，并注意 Agent shell 中大小写重复环境变量（`PATH`/`Path` 等）会导致 MSBuild `MSB6001`，需先去重（见 `docs/STATUS.md`）。
+> 当前状态（2026-11-28）：本文构建步骤有效，当前补丁与 exe 为 build25（首交点接入 EEVEE 全材质节点系统，`D:\build_windows_x64_vc17_Release\bin\Release\blender.exe`，MTIME `20:56:58`，EXITCODE=0 / 0 errors）。增量构建前须确认无 Blender 进程占用 exe，并注意 Agent shell 中大小写重复环境变量（`PATH`/`Path` 等）会导致 MSBuild `MSB6001`，需先去重（见 `docs/STATUS.md`）。
 
 ## 1. 获取 Blender 源码
 

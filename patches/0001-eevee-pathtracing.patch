@@ -366,10 +366,10 @@ index a1d6493d..7a73ba82 100644
    bool uses_render_border() const final
 diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing.cc b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
 new file mode 100644
-index 00000000..af75ef5a
+index 00000000..d11e029d
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/eevee_pathtracing.cc
-@@ -0,0 +1,863 @@
+@@ -0,0 +1,901 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -907,11 +907,41 @@ index 00000000..af75ef5a
 +      light_buf_[0] = {};
 +    }
 +    light_buf_.push_update();
++
++    /* Detect lighting/material/world edits so NRD can drop stale history in one frame instead
++     * of fading it out over 31 frames. Camera navigation and plain object motion leave this
++     * hash untouched, keeping the smooth 31-frame accumulation. */
++    auto hash_bytes = [](uint64_t h, const void *data, size_t size) {
++      const uint8_t *bytes = static_cast<const uint8_t *>(data);
++      for (size_t i = 0; i < size; i++) {
++        h ^= uint64_t(bytes[i]);
++        h *= 1099511628211ULL;
++      }
++      return h;
++    };
++    uint64_t lighting_hash = 14695981039346656037ULL;
++    lighting_hash = hash_bytes(lighting_hash, &data_buf_.background, sizeof(data_buf_.background));
++    if (!lights_.is_empty()) {
++      lighting_hash = hash_bytes(
++          lighting_hash, lights_.data(), lights_.size() * sizeof(LightRecord));
++    }
++    if (!materials_.is_empty()) {
++      lighting_hash = hash_bytes(
++          lighting_hash, materials_.data(), materials_.size() * sizeof(MaterialRecord));
++    }
++    if (nrd_session_started_ && lighting_hash != last_lighting_hash_) {
++      lighting_reset_pending_ = true;
++    }
++    last_lighting_hash_ = lighting_hash;
 +  }
 +
 +  pass_.init();
 +  pass_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_DEPTH_ALWAYS);
 +  pass_.shader_set(shader_.get());
++  pass_.bind_resources(inst_.gbuffer);
++  pass_.bind_texture("in_depth_tx", &inst_.render_buffers.depth_tx);
++  pass_.bind_texture("in_vector_tx", &inst_.render_buffers.vector_tx);
++  pass_.bind_texture("in_emission_tx", &primary_emission_tx_);
 +  pass_.bind_ubo("pathtracing_data", &data_buf_);
 +  pass_.bind_ssbo("instance_buf", &instance_buf_);
 +  pass_.bind_ssbo("primitive_buf", &primitive_buf_);
@@ -1028,8 +1058,10 @@ index 00000000..af75ef5a
 +   * denoised image never converges and stays noisy. The old "red halo" this workaround hid was
 +   * actually the emission-proxy demodulation bug, now fixed at the shader level. */
 +  const bool pending_reset = history_reset_pending_;
++  const bool lighting_reset = lighting_reset_pending_;
 +  const bool sampling_reset = eevee_sample_index == 0 || pending_reset;
 +  history_reset_pending_ = false;
++  lighting_reset_pending_ = false;
 +  /* NRD session reset: only a genuine new session, resolution change, or non-sequential still
 +   * render. Camera navigation and sampling restarts are deliberately excluded here. */
 +  const bool new_session = !nrd_session_started_ || resolution_changed || frame_jump;
@@ -1077,11 +1109,16 @@ index 00000000..af75ef5a
 +  debug_view_was_active_ = debug_view_active;
 +
 +  const eGPUTextureUsage taa_usage = eGPUTextureUsage(GPU_TEXTURE_USAGE_SHADER_READ |
-+                                                      GPU_TEXTURE_USAGE_SHADER_WRITE);
++                                                      GPU_TEXTURE_USAGE_SHADER_WRITE |
++                                                      GPU_TEXTURE_USAGE_ATTACHMENT);
 +  /* composite_pass_ writes straight to combined_fb_ for EEVEE's film.accumulate(); only the
 +   * composed texture is kept, and only because the validation pass reads it as its base. The
 +   * two full-resolution TAA history ping-pong textures and the TAA pass are gone. */
 +  taa_composed_tx_.ensure_2d(gpu::TextureFormat::SFLOAT_16_16_16_16, extent, taa_usage);
++
++  const eGPUTextureUsage emission_usage = eGPUTextureUsage(GPU_TEXTURE_USAGE_GENERAL);
++  primary_emission_tx_.ensure_2d(gpu::TextureFormat::SFLOAT_16_16_16_16, extent, emission_usage);
++  GPU_texture_copy(primary_emission_tx_, inst_.render_buffers.combined_tx);
 +
 +  data_buf_.taa_history_valid = taa_history_valid_ ? 1u : 0u;
 +  data_buf_.prev_world_to_view = prev_world_to_view_;
@@ -1092,7 +1129,8 @@ index 00000000..af75ef5a
 +  data_buf_.prev_jitter = prev_jitter_;
 +  data_buf_.push_update();
 +
-+  combined_fb.bind();
++  raytrace_fb_.ensure(GPU_ATTACHMENT_NONE, GPU_ATTACHMENT_TEXTURE(taa_composed_tx_));
++  raytrace_fb_.bind();
 +  inst_.manager->submit(pass_, view);
 +
 +  /* Publish un-jittered matrices for the next frame's motion-vector reprojection. */
@@ -1146,7 +1184,7 @@ index 00000000..af75ef5a
 +    nrd_input.camera_jitter[1] = -camera_jitter.y;
 +    nrd_input.camera_jitter_prev[0] = prev_jitter_.x;
 +    nrd_input.camera_jitter_prev[1] = -prev_jitter_.y;
-+    nrd_input.reset_history = new_session ||
++    nrd_input.reset_history = new_session || lighting_reset ||
 +                              std::getenv("EEVEE_PT_NO_NRD_HISTORY") != nullptr;
 +
 +    const bool disable_nrd = std::getenv("EEVEE_PT_NO_NRD") != nullptr;
@@ -1235,10 +1273,10 @@ index 00000000..af75ef5a
 +}  // namespace blender::eevee
 diff --git a/source/blender/draw/engines/eevee/eevee_pathtracing.hh b/source/blender/draw/engines/eevee/eevee_pathtracing.hh
 new file mode 100644
-index 00000000..9e5845c3
+index 00000000..d1f0cd64
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/eevee_pathtracing.hh
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,166 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -1329,6 +1367,8 @@ index 00000000..9e5845c3
 +   * last case covers camera navigation: EEVEE clears its sampling state before the draw
 +   * pass, so `end_sync()` records it here for the following `render()`. */
 +  bool nrd_session_started_ = false;
++  uint64_t last_lighting_hash_ = 0;
++  bool lighting_reset_pending_ = false;
 +  int2 nrd_extent_ = int2(0);
 +  int last_render_frame_ = -1;
 +  bool history_reset_pending_ = false;
@@ -1346,6 +1386,10 @@ index 00000000..9e5845c3
 +  /* Final temporal accumulation, following the NRD-Sample TAA pass. The composite writes its
 +   * result to `taa_composed_tx_`, and TAA resolves it into the render result while storing the
 +   * history in one of two ping-pong textures. */
++  /* Copy of combined_tx (G-Buffer emission) for sampling without a depth read/write hazard. */
++  draw::Texture primary_emission_tx_ = {"PathTracingPrimaryEmission"};
++  /* Path trace pass target without depth attachment, avoiding Vulkan depth layout conflicts. */
++  draw::Framebuffer raytrace_fb_ = {"PathTracingRaytraceFB"};
 +  draw::Texture taa_composed_tx_ = {"PathTracingTAAComposed"};
 +  draw::Texture taa_history_a_tx_ = {"PathTracingTAAHistoryA"};
 +  draw::Texture taa_history_b_tx_ = {"PathTracingTAAHistoryB"};
@@ -1528,7 +1572,7 @@ index 00000000..e74d7519
 +}  // namespace blender::eevee
 +#endif
 diff --git a/source/blender/draw/engines/eevee/eevee_pipeline.cc b/source/blender/draw/engines/eevee/eevee_pipeline.cc
-index ac8fed5e..e565ae3a 100644
+index ac8fed5e..a54c1180 100644
 --- a/source/blender/draw/engines/eevee/eevee_pipeline.cc
 +++ b/source/blender/draw/engines/eevee/eevee_pipeline.cc
 @@ -1090,7 +1090,7 @@ gpu::Texture *DeferredLayer::render(View &render_view,
@@ -1540,17 +1584,43 @@ index ac8fed5e..e565ae3a 100644
      /* Update for refraction. */
      inst_.hiz_buffer.update();
    }
-@@ -1104,6 +1104,10 @@ gpu::Texture *DeferredLayer::render(View &render_view,
-     inst_.manager->submit(clear_aovs_ps_);
-   }
+@@ -1108,6 +1108,14 @@ gpu::Texture *DeferredLayer::render(View &render_view,
+   /* Update for lighting pass or AO node. */
+   inst_.hiz_buffer.update();
  
 +  if (inst_.path_tracing.enabled()) {
++    /* Run gbuffer_ps_ to evaluate all Blender shader nodes into inst_.gbuffer + combined_tx
++     * (emission), then skip EEVEE shadows, SSRT, light eval, SSS, and deferred combine. */
++    inst_.gbuffer.bind(gbuffer_fb);
++    inst_.manager->submit(gbuffer_ps_, render_view);
 +    return nullptr;
 +  }
 +
-   inst_.hiz_buffer.swap_layer();
-   /* Update for lighting pass or AO node. */
-   inst_.hiz_buffer.update();
+   inst_.volume_probes.set_view(render_view);
+   inst_.sphere_probes.set_view(render_view);
+   inst_.shadows.render(render_view, extent);
+@@ -1237,7 +1245,9 @@ PassMain::Sub *DeferredPipeline::prepass_add(blender::Material *blender_mat,
+                                              bool has_motion,
+                                              bool hide_from_raycast)
+ {
+-  if (blender_mat->blend_flag & MA_BL_SS_REFRACTION) {
++  if (!opaque_layer_.inst_.path_tracing.enabled() &&
++      (blender_mat->blend_flag & MA_BL_SS_REFRACTION))
++  {
+     return refraction_layer_.prepass_add(blender_mat, gpumat, has_motion, hide_from_raycast);
+   }
+   return opaque_layer_.prepass_add(blender_mat, gpumat, has_motion, hide_from_raycast);
+@@ -1245,7 +1255,9 @@ PassMain::Sub *DeferredPipeline::prepass_add(blender::Material *blender_mat,
+ 
+ PassMain::Sub *DeferredPipeline::material_add(blender::Material *blender_mat, GPUMaterial *gpumat)
+ {
+-  if (blender_mat->blend_flag & MA_BL_SS_REFRACTION) {
++  if (!opaque_layer_.inst_.path_tracing.enabled() &&
++      (blender_mat->blend_flag & MA_BL_SS_REFRACTION))
++  {
+     return refraction_layer_.material_add(blender_mat, gpumat);
+   }
+   return opaque_layer_.material_add(blender_mat, gpumat);
 diff --git a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
 index ca9abfbd..135dbe42 100644
 --- a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
@@ -1661,58 +1731,30 @@ index 0c41a9ac..9b2a7edc 100644
  
    if (inst_.is_image_render) {
 diff --git a/source/blender/draw/engines/eevee/eevee_view.cc b/source/blender/draw/engines/eevee/eevee_view.cc
-index 67126e73..4ea1cf55 100644
+index 67126e73..c90c2a9a 100644
 --- a/source/blender/draw/engines/eevee/eevee_view.cc
 +++ b/source/blender/draw/engines/eevee/eevee_view.cc
-@@ -109,18 +109,22 @@ void ShadingView::render()
+@@ -109,6 +109,8 @@ void ShadingView::render()
        with_raycast ? GPU_ATTACHMENT_TEXTURE(rbufs.object_id_tx) : GPU_ATTACHMENT_NONE,
        GPU_ATTACHMENT_TEXTURE(rbufs.vector_tx));
  
--  GBuffer &gbuf = inst_.gbuffer;
--  gbuf.acquire(extent_,
--               inst_.pipelines.deferred.header_layer_count(),
--               inst_.pipelines.deferred.closure_layer_count(),
--               inst_.pipelines.deferred.normal_layer_count());
--
--  gbuffer_fb_.ensure(GPU_ATTACHMENT_TEXTURE(rbufs.depth_tx),
--                     GPU_ATTACHMENT_TEXTURE(rbufs.combined_tx),
--                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.header_tx.layer_view(0), 0),
--                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.normal_tx.layer_view(0), 0),
--                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(0), 0),
--                     GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(1), 0));
 +  const bool pt_enabled = inst_.path_tracing.enabled();
 +
-+  if (!pt_enabled) {
-+    GBuffer &gbuf = inst_.gbuffer;
-+    gbuf.acquire(extent_,
-+                 inst_.pipelines.deferred.header_layer_count(),
-+                 inst_.pipelines.deferred.closure_layer_count(),
-+                 inst_.pipelines.deferred.normal_layer_count());
-+
-+    gbuffer_fb_.ensure(GPU_ATTACHMENT_TEXTURE(rbufs.depth_tx),
-+                       GPU_ATTACHMENT_TEXTURE(rbufs.combined_tx),
-+                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.header_tx.layer_view(0), 0),
-+                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.normal_tx.layer_view(0), 0),
-+                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(0), 0),
-+                       GPU_ATTACHMENT_TEXTURE_LAYER(gbuf.closure_tx.layer_view(1), 0));
-+  }
- 
-   /* If camera has any motion, compute motion vector in the film pass. Otherwise, we avoid float
-    * precision issue by setting the motion of all static geometry to 0. */
-@@ -136,14 +140,21 @@ void ShadingView::render()
+   GBuffer &gbuf = inst_.gbuffer;
+   gbuf.acquire(extent_,
+                inst_.pipelines.deferred.header_layer_count(),
+@@ -136,6 +138,10 @@ void ShadingView::render()
    /* Alpha stores transmittance. So start at 1. */
    GPU_framebuffer_clear_color_depth(
        combined_fb_, {0.0, 0.0, 0.0, 1.0}, inst_.film.depth.clear_value);
--  inst_.pipelines.background.clear(render_view_);
 +  /* Path Tracing replaces the traditional raster shading. Skip the empty background/volume/
 +   * AO/forward passes and the debug overlays. The deferred prepass still runs below so the
 +   * depth buffer (used by viewport grids and the orange selection outline) stays correct. */
-+  if (!pt_enabled) {
-+    inst_.pipelines.background.clear(render_view_);
-+  }
++  /* Always clear cryptomatte / rp_* render passes, even in path tracing mode. */
+   inst_.pipelines.background.clear(render_view_);
  
    /* TODO(fclem): Move it after the first prepass (and hiz update) once pipeline is stabilized. */
-   inst_.lights.set_view(render_view_, extent_);
+@@ -143,7 +149,9 @@ void ShadingView::render()
  
    inst_.hiz_buffer.set_source(&inst_.render_buffers.depth_tx);
  
@@ -1723,17 +1765,13 @@ index 67126e73..4ea1cf55 100644
  
    inst_.pipelines.deferred.render(main_view_,
                                    render_view_,
-@@ -154,30 +165,41 @@ void ShadingView::render()
+@@ -154,30 +162,43 @@ void ShadingView::render()
                                    rt_buffer_opaque_,
                                    rt_buffer_refract_);
  
 -  inst_.pipelines.background.render(render_view_, combined_fb_);
 +  if (!pt_enabled) {
 +    inst_.pipelines.background.render(render_view_, combined_fb_);
-+  }
-+
-+  if (!pt_enabled) {
-+    inst_.gbuffer.release();
 +  }
  
 -  inst_.gbuffer.release();
@@ -1762,6 +1800,8 @@ index 67126e73..4ea1cf55 100644
 +    inst_.sphere_probes.viewport_draw(render_view_, combined_fb_);
 +    inst_.planar_probes.viewport_draw(render_view_, combined_fb_);
 +  }
++
++  inst_.path_tracing.render(render_view_, main_view_, combined_fb_, render_jitter_);
  
 -  inst_.lights.debug_draw(render_view_, combined_fb_);
 -  inst_.hiz_buffer.debug_draw(render_view_, combined_fb_);
@@ -1769,7 +1809,11 @@ index 67126e73..4ea1cf55 100644
 -  inst_.volume_probes.viewport_draw(render_view_, combined_fb_);
 -  inst_.sphere_probes.viewport_draw(render_view_, combined_fb_);
 -  inst_.planar_probes.viewport_draw(render_view_, combined_fb_);
-+  inst_.path_tracing.render(render_view_, main_view_, combined_fb_, render_jitter_);
++  /* Stage 1: the path tracing pass binds the G-Buffer textures and is submitted above, so the
++   * G-Buffer must stay acquired until after that submit. Releasing it before render (as the
++   * original code did, safe only when PT didn't bind G-Buffer) made every bound TextureFromPool
++   * resolve to a null gpu::Texture at submit time -> GPU_texture_bind_ex read NULL+8 crash. */
++  inst_.gbuffer.release();
  
    gpu::Texture *combined_final_tx = render_postfx(rbufs.combined_tx);
 -  inst_.film.accumulate(jitter_view_, combined_final_tx);
@@ -1780,7 +1824,7 @@ index 67126e73..4ea1cf55 100644
  
    rbufs.release();
    postfx_tx_.release();
-@@ -273,7 +295,8 @@ void ShadingView::update_view()
+@@ -273,7 +294,8 @@ void ShadingView::update_view()
    }
  
    /* Anti-Aliasing / Super-Sampling jitter. */
@@ -1852,10 +1896,10 @@ index 3941b7f8..d73e749d 100644
        frag_out.color.rgb =
 diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh
 new file mode 100644
-index 00000000..e14da043
+index 00000000..dbc8b4b9
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_composite.bsl.hh
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,165 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -1985,17 +2029,11 @@ index 00000000..e14da043
 +    frag_out.color = float4(debug_color, 0.0f);
 +    return;
 +  }
-+  /* RELAX classifies sky per 16x16 tile (all 256 pixels must be sky) and leaves skipped
-+   * tiles unwritten (exact zeros). Near silhouettes a tile can flip between sky and mixed
-+   * from frame to frame, so geometry pixels inside a skipped tile would otherwise be black.
-+   * Fall back to the raw path traced radiance whenever NRD did not write the pixel. */
-+  const bool denoised_valid = (denoised.x + denoised.y + denoised.z +
-+                               denoised_spec.x + denoised_spec.y + denoised_spec.z) != 0.0f;
 +  /* Remodulate by the per-pixel factors removed before denoising. Both raw and denoised signals
 +   * use the REBLUR YCoCg encoding. */
 +  float3 composed_diff = ycocg_to_linear(denoised.rgb) * diff_factor;
 +  float3 composed_spec = ycocg_to_linear(denoised_spec.rgb) * spec_factor;
-+  if (srt.raw_only != 0.0f || is_sky || !denoised_valid) {
++  if (srt.raw_only != 0.0f || is_sky) {
 +    composed_diff = ycocg_to_linear(raw.rgb) * diff_factor;
 +    composed_spec = ycocg_to_linear(raw_spec.rgb) * spec_factor;
 +  }
@@ -2011,7 +2049,7 @@ index 00000000..e14da043
 +    /* SIGMA only modulates the sun's share of the direct signal. Local lights were already
 +     * shadowed by their visibility rays. */
 +    const float shadow_packed = imageLoad(srt.in_shadow_img, nrd_texel).r;
-+    const float shadow = (srt.raw_only != 0.0f || is_sky || !denoised_valid) ?
++    const float shadow = (srt.raw_only != 0.0f || is_sky) ?
 +                             1.0f :
 +                             shadow_packed * shadow_packed;
 +    const float sun_fraction = aux.diff_factor.a;
@@ -2029,10 +2067,10 @@ index 00000000..e14da043
 +}  // namespace eevee::pathtracing
 diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
 new file mode 100644
-index 00000000..4f0a3eab
+index 00000000..43942df0
 --- /dev/null
 +++ b/source/blender/draw/engines/eevee/shaders/eevee_pathtracing_debug.bsl.hh
-@@ -0,0 +1,1417 @@
+@@ -0,0 +1,1489 @@
 +/* SPDX-FileCopyrightText: 2026 Blender Authors
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later */
@@ -2046,7 +2084,10 @@ index 00000000..4f0a3eab
 +#pragma once
 +
 +#include "draw_view.bsl.hh"
++#include "eevee_gbuffer_read.bsl.hh"
 +#include "eevee_pathtracing_shared.hh"
++#include "eevee_reverse_z_lib.bsl.hh"
++#include "eevee_velocity_shared.hh"
 +#include "gpu_shader_fullscreen.bsl.hh"
 +
 +namespace eevee::pathtracing {
@@ -2059,6 +2100,9 @@ index 00000000..4f0a3eab
 +  [[storage(3, read)]] const LightRecord (&light_buf)[];
 +  [[storage(4, write)]] PathTracingAux (&out_aux_buf)[];
 +  [[acceleration_structure(0)]] const accelerationStructure scene_as;
++  [[sampler(0)]] const sampler2D in_depth_tx;
++  [[sampler(1)]] const sampler2D in_vector_tx;
++  [[sampler(2)]] const sampler2D in_emission_tx;
 +  [[image(0, write, UNORM_10_10_10_2)]] image2D out_normal_roughness_img;
 +  [[image(1, write, SFLOAT_32)]] image2D out_viewz_img;
 +  [[image(2, write, SFLOAT_16_16_16_16)]] image2D out_diffuse_img;
@@ -2500,12 +2544,12 @@ index 00000000..4f0a3eab
 +[[fragment]] void frag([[frag_coord]] const float4 frag_co,
 +                       [[resource_table]] Resources &srt,
 +                       [[resource_table]] const draw::View &views,
++                       [[resource_table]] const gbuffer::Reader &gbuf_reader,
 +                       [[out]] PathtracingFragOut &frag_out)
 +{
 +  const float2 resolution = float2(srt.pathtracing_data.resolution);
-+  /* The render view already contains the film's sub-pixel jitter. Adding the sample jitter here
-+   * again would double-jitter the rays and desynchronize them from the motion vectors. */
 +  const float2 screen_uv = frag_co.xy / resolution;
++  const int2 frag_texel = int2(frag_co.xy);
 +
 +  const ViewMatrices view = views.get(0);
 +  const float3 near_point = view.point_screen_to_world(float3(screen_uv, 0.0f));
@@ -2515,10 +2559,6 @@ index 00000000..4f0a3eab
 +  rng.state = hash_u32(uint(frag_co.x) + uint(frag_co.y) * uint(resolution.x) +
 +                       srt.pathtracing_data.sample_index * 9781u);
 +
-+  /* Trace the primary camera ray ONCE and share the hit with both lobes. Previously each lobe
-+   * re-traced the same primary ray and re-evaluated the same SSBO lookup, inverse matrix and
-+   * direct lighting. Now the primary intersection and its direct light are computed once; the
-+   * lobe loop below only walks the indirect path starting at bounce 1. */
 +  const float3 primary_ray_origin = near_point;
 +  const float3 primary_ray_direction = safe_normalize(far_point - near_point,
 +                                                      float3(0.0f, 0.0f, -1.0f));
@@ -2554,125 +2594,142 @@ index 00000000..4f0a3eab
 +  const uint debug_flags = srt.pathtracing_data.pad0;
 +
 +  /* --------------------------------------------------------
-+   * 1. Trace primary camera ray ONCE (shared by both lobes).
++   * 1. Read primary surface from EEVEE Prepass Depth + G-Buffer (full node tree support!).
 +   * -------------------------------------------------------- */
-+  rayQuery primary_query;
-+  rayQueryInitialize(primary_query,
-+                     srt.scene_as,
-+                     gpu_RayFlagsNone,
-+                     0xFFu,
-+                     primary_ray_origin,
-+                     1e-4f,
-+                     primary_ray_direction,
-+                     1e30f);
-+  while (rayQueryProceed(primary_query)) {
-+  }
++  const float raw_depth = texelFetch(srt.in_depth_tx, frag_texel, 0).r;
++  const gbuffer::Layers gbuf_layers = gbuf_reader.read_layers(frag_texel);
++  const bool primary_valid = (raw_depth > 0.0f) && !gbuf_layers.header.is_empty();
 +
-+  bool primary_valid = false;
-+  InstanceRecord p_instance;
-+  MaterialRecord p_material;
-+  float3 p_normal = float3(0.0f, 0.0f, 1.0f);
++  float3 p_diff_color = float3(0.0f);
++  float3 p_diff_N = float3(0.0f);
++  float diff_weight_sum = 0.0f;
++
++  float3 p_spec_color = float3(0.0f);
++  float3 p_spec_N = float3(0.0f);
++  float p_spec_roughness = 0.0f;
++  float spec_weight_sum = 0.0f;
++
++  float3 p_transmit_color = float3(0.0f);
++  float3 p_transmit_N = float3(0.0f);
++  float p_transmit_roughness = 0.0f;
++  float p_transmit_ior = 1.5f;
++  uint p_transmit_type = 0u; /* 0=none, 1=refraction, 2=thin_glass, 3=translucent */
++  float transmit_weight_sum = 0.0f;
++
 +  float3 p_offset_normal = float3(0.0f, 0.0f, 1.0f);
-+  float p_ray_epsilon = 1e-4f;
-+  float p_curvature = 0.0f;
-+  float p_roughness = 1.0f;
-+  float3 p_diffuse_color = float3(0.0f);
-+  float3 p_f0 = float3(0.04f);
-+  float p_alpha = 1.0f;
-+  float p_alpha2 = 1.0f;
++  float p_ray_epsilon = 5e-4f;
 +  float3 p_wo = -primary_ray_direction;
-+  float p_ndotv = 1.0f;
-+
-+  if (rayQueryGetIntersectionType(primary_query, true) != gpu_RayQueryCommittedIntersectionNone) {
-+    const uint instance_id = rayQueryGetIntersectionInstanceCustomIndex(primary_query, true);
-+    const uint primitive_index = rayQueryGetIntersectionPrimitiveIndex(primary_query, true);
-+    if (instance_id < srt.pathtracing_data.instance_count) {
-+      p_instance = srt.instance_buf[instance_id];
-+      const uint primitive_id = p_instance.primitive_offset + primitive_index;
-+      if (primitive_id < srt.pathtracing_data.primitive_count) {
-+        const PrimitiveRecord primitive = srt.primitive_buf[primitive_id];
-+        if (primitive.material_id < srt.pathtracing_data.material_count) {
-+          p_material = srt.material_buf[primitive.material_id];
-+          primary_valid = true;
-+
-+          const float hit_distance = rayQueryGetIntersectionT(primary_query, true);
-+          const float3 hit_position = primary_ray_origin + primary_ray_direction * hit_distance;
-+
-+          const float3x3 object_matrix = float3x3(p_instance.object_to_world[0].xyz,
-+                                                  p_instance.object_to_world[1].xyz,
-+                                                  p_instance.object_to_world[2].xyz);
-+          const float3x3 normal_matrix = transpose(inverse(object_matrix));
-+          const float3 geometric_normal = safe_normalize(normal_matrix * primitive.normal.xyz,
-+                                                         float3(0.0f, 0.0f, 1.0f));
-+          const bool front_face = dot(geometric_normal, primary_ray_direction) < 0.0f;
-+          const float2 bary = rayQueryGetIntersectionBarycentrics(primary_query, true);
-+          const float3 bary3 = float3(1.0f - bary.x - bary.y, bary.x, bary.y);
-+          float3 shading_normal = (normal_matrix * primitive.normal0.xyz) * bary3.x +
-+                                  (normal_matrix * primitive.normal1.xyz) * bary3.y +
-+                                  (normal_matrix * primitive.normal2.xyz) * bary3.z;
-+          shading_normal = safe_normalize(shading_normal, geometric_normal);
-+          if (dot(shading_normal, geometric_normal) < 0.0f) {
-+            shading_normal = -shading_normal;
-+          }
-+          p_normal = front_face ? shading_normal : -shading_normal;
-+
-+          const float3 dn01 = primitive.normal0.xyz - primitive.normal1.xyz;
-+          const float3 dn12 = primitive.normal1.xyz - primitive.normal2.xyz;
-+          const float3 dn20 = primitive.normal2.xyz - primitive.normal0.xyz;
-+          const float dn_sq = max(dot(dn01, dn01), max(dot(dn12, dn12), dot(dn20, dn20)));
-+          const float object_scale = max(length(object_matrix[0]),
-+                                         max(length(object_matrix[1]), length(object_matrix[2])));
-+          const float world_area = primitive.area * object_scale * object_scale;
-+          p_curvature = (world_area > 1e-12f) ? sqrt(dn_sq / world_area) : 0.0f;
-+
-+          const float normal_deviation = 1.0f - saturate(dot(shading_normal, geometric_normal));
-+          p_ray_epsilon = 1e-4f + hit_distance * 1e-6f + normal_deviation * 1e-4f;
-+          p_offset_normal = front_face ? geometric_normal : -geometric_normal;
-+
-+          const float3 base_color = p_material.base_color.rgb;
-+          p_roughness = clamp(p_material.params.x, 0.05f, 1.0f);
-+          const float metallic = clamp(p_material.params.y, 0.0f, 1.0f);
-+          const float ior = 1.5f;
-+          primary_emission = p_material.emission.rgb;
-+
-+          nrd_normal = p_normal;
-+          nrd_roughness = p_roughness;
-+          nrd_material_id = metallic > 0.5f ? 1.0f : 0.0f;
-+          /* NRD expects raw view-space Z. Blender looks down -Z, so hits are negative. */
-+          nrd_viewz = view.point_world_to_view(hit_position).z;
-+          primary_hit_position = hit_position;
-+          primary_prev_hit_position = to_previous_world(p_instance, hit_position);
-+          primary_hit = true;
-+
-+          p_diffuse_color = base_color * (1.0f - metallic);
-+          const float dielectric_f0 = pow((ior - 1.0f) / (ior + 1.0f), 2.0f);
-+          p_f0 = float3(dielectric_f0) * (1.0f - metallic) + base_color * metallic;
-+          p_alpha = p_roughness * p_roughness;
-+          p_alpha2 = p_alpha * p_alpha;
-+          p_wo = -primary_ray_direction;
-+          p_ndotv = max(dot(p_normal, p_wo), 1e-4f);
-+
-+          nrd_material_factors(
-+              p_normal, p_wo, p_diffuse_color, p_f0, p_roughness, diff_factor, spec_factor);
-+        }
-+      }
-+    }
-+  }
 +
 +  if (!primary_valid) {
-+    /* Primary miss: the composite pass uses the raw signal for sky pixels. Write once. */
 +    const float3 background_radiance = clamp_radiance_luminance_preserving(
 +        background, srt.pathtracing_data.clamp_direct);
 +    if (valid_radiance(background_radiance)) {
 +      diff_radiance = background_radiance;
 +    }
 +  }
-+else {
++  else {
++    const float depth = reverse_z::read(raw_depth);
++    primary_hit_position = view.point_screen_to_world(float3(screen_uv, depth));
++    primary_prev_hit_position = primary_hit_position;
++    nrd_viewz = view.point_world_to_view(primary_hit_position).z;
++    primary_hit = true;
++
++    const float3 surface_N = gbuf_layers.surface_N();
++    const float3 Ng = gbuf_layers.header.geometry_normal(surface_N);
++    p_offset_normal = (dot(Ng, p_wo) >= 0.0f) ? Ng : -Ng;
++    p_ray_epsilon = 5e-4f + abs(nrd_viewz) * 1e-4f;
++
++    primary_emission = max(texelFetch(srt.in_emission_tx, frag_texel, 0).rgb, float3(0.0f));
++
++    const uchar closure_count = gbuf_layers.header.closure_len();
++    const Thickness thickness = gbuf_layers.header.has_additional_data() ?
++                                    gbuf_reader.read_thickness(gbuf_layers.header, frag_texel) :
++                                    Thickness::zero();
++
++    for (int i = 0; i < 3; i++) {
++      if (i < int(closure_count)) {
++        const ClosureUndetermined cl = gbuf_layers.layer[i];
++        const float w = max(cl.color.x, max(cl.color.y, cl.color.z));
++        switch (cl.type) {
++          case CLOSURE_BSDF_DIFFUSE_ID:
++          case CLOSURE_BSSRDF_BURLEY_ID:
++            p_diff_color += cl.color;
++            p_diff_N += cl.N * w;
++            diff_weight_sum += w;
++            break;
++          case CLOSURE_BSDF_MICROFACET_GGX_REFLECTION_ID: {
++            const float r = clamp(cl.data.x, 0.05f, 1.0f);
++            p_spec_color += cl.color;
++            p_spec_N += cl.N * w;
++            p_spec_roughness += r * w;
++            spec_weight_sum += w;
++            break;
++          }
++          case CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID: {
++            const float r = clamp(cl.data.x, 0.02f, 1.0f);
++            p_transmit_color += (thickness.value() != 0.0f) ? (cl.color * cl.color) : cl.color;
++            p_transmit_N += cl.N * w;
++            p_transmit_roughness += r * w;
++            p_transmit_ior = max(cl.data.y, 1.01f);
++            p_transmit_type = 1u;
++            transmit_weight_sum += w;
++            break;
++          }
++          case CLOSURE_BSDF_THIN_GLASS_TRANSMISSION_ID: {
++            const float r = clamp(cl.data.x, 0.02f, 1.0f);
++            p_transmit_color += cl.color;
++            p_transmit_N += cl.N * w;
++            p_transmit_roughness += r * w;
++            p_transmit_type = 2u;
++            transmit_weight_sum += w;
++            break;
++          }
++          case CLOSURE_BSDF_TRANSLUCENT_ID:
++            p_transmit_color += (thickness.value() != 0.0f) ? (cl.color * cl.color) : cl.color;
++            p_transmit_N += cl.N * w;
++            p_transmit_type = 3u;
++            transmit_weight_sum += w;
++            break;
++          default:
++            break;
++        }
++      }
++    }
++
++    p_diff_N = (diff_weight_sum > 1e-6f) ? safe_normalize(p_diff_N, surface_N) : surface_N;
++    if (spec_weight_sum > 1e-6f) {
++      p_spec_N = safe_normalize(p_spec_N, surface_N);
++      p_spec_roughness = clamp(p_spec_roughness / spec_weight_sum, 0.05f, 1.0f);
++    }
++    else {
++      p_spec_N = surface_N;
++      p_spec_roughness = 1.0f;
++    }
++    if (transmit_weight_sum > 1e-6f) {
++      p_transmit_N = safe_normalize(p_transmit_N, surface_N);
++      p_transmit_roughness = clamp(p_transmit_roughness / transmit_weight_sum, 0.02f, 1.0f);
++    }
++    else {
++      p_transmit_N = surface_N;
++      p_transmit_roughness = 0.05f;
++    }
++
++    const float p_spec_alpha = p_spec_roughness * p_spec_roughness;
++    const float p_spec_alpha2 = p_spec_alpha * p_spec_alpha;
++    const float p_spec_ndotv = max(dot(p_spec_N, p_wo), 1e-4f);
++
++    /* NRD guide buffers & demodulation factors from resolved G-Buffer closures. */
++    nrd_normal = (spec_weight_sum > diff_weight_sum) ? p_spec_N : p_diff_N;
++    nrd_roughness = (spec_weight_sum > 1e-5f) ? p_spec_roughness : 1.0f;
++    nrd_material_id = (diff_weight_sum < 1e-4f && spec_weight_sum > 1e-4f) ? 1.0f : 0.0f;
++    diff_factor = mix(float3(0.02f), float3(1.0f), saturate(p_diff_color));
++    spec_factor = mix(
++        float3(0.02f),
++        float3(1.0f),
++        saturate(max(p_spec_color, p_transmit_color)) * mix(0.1f, 1.0f, nrd_roughness));
++
 +    /* --------------------------------------------------------
-+     * 2. Primary direct lighting:
-+     *    - Sun (type 1) stays in direct_radiance (denoised by SIGMA if shadow enabled).
-+     *    - Local lights (Point/Spot/Area) go into local_direct_diff/spec (denoised by REBLUR),
-+     *      with Power-Heuristic MIS for area-light specular.
++     * 2. Primary direct lighting using G-Buffer closures (already Fresnel-weighted).
 +     * -------------------------------------------------------- */
 +    for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
 +      const LightRecord light = srt.light_buf[light_id];
@@ -2780,8 +2837,9 @@ index 00000000..4f0a3eab
 +        }
 +      }
 +
-+      const float ndotl = max(dot(p_normal, wi), 0.0f);
-+      if (ndotl <= 0.0f || shadow_distance <= p_ray_epsilon) {
++      const float ndotl_diff = max(dot(p_diff_N, wi), 0.0f);
++      const float ndotl_spec = max(dot(p_spec_N, wi), 0.0f);
++      if ((ndotl_diff <= 0.0f && ndotl_spec <= 0.0f) || shadow_distance <= p_ray_epsilon) {
 +        continue;
 +      }
 +
@@ -2804,33 +2862,36 @@ index 00000000..4f0a3eab
 +        }
 +      }
 +
-+      const float3 h_vec = wi + p_wo;
-+      const float3 half_vector = (dot(h_vec, h_vec) > 1e-8f) ? safe_normalize(h_vec, p_normal) :
-+                                                               p_normal;
-+      const float ndoth = saturate(dot(p_normal, half_vector));
-+      const float vdoth = saturate(dot(p_wo, half_vector));
-+      const float3 fresnel = fresnel_schlick(p_f0, vdoth);
-+      const float distribution = ggx_distribution(ndoth, p_alpha2);
-+      const float geometry = smith_g1(p_ndotv, p_alpha2) * smith_g1(ndotl, p_alpha2);
-+      const float3 specular = (distribution * geometry) * fresnel /
-+                              max(4.0f * ndotl * p_ndotv, 1e-4f);
++      float3 direct_diffuse = irradiance * ndotl_diff * p_diff_color * inv_pi * diff_fac;
++      float3 direct_specular = float3(0.0f);
++      if (spec_weight_sum > 1e-6f && ndotl_spec > 0.0f && spec_fac > 0.0f) {
++        const float3 h_vec = wi + p_wo;
++        const float3 half_vector = (dot(h_vec, h_vec) > 1e-8f) ? safe_normalize(h_vec, p_spec_N) :
++                                                                 p_spec_N;
++        const float ndoth = saturate(dot(p_spec_N, half_vector));
++        const float vdoth = saturate(dot(p_wo, half_vector));
++        const float distribution = ggx_distribution(ndoth, p_spec_alpha2);
++        const float geometry = smith_g1(p_spec_ndotv, p_spec_alpha2) *
++                               smith_g1(ndotl_spec, p_spec_alpha2);
++        const float3 specular = (distribution * geometry) * p_spec_color /
++                                max(4.0f * ndotl_spec * p_spec_ndotv, 1e-4f);
 +
-+      float mis_spec_weight = 1.0f;
-+      if (is_area_light && (debug_flags & 4u) == 0u) {
-+        const float pdf_bsdf_w = distribution * ndoth / max(4.0f * vdoth, 1e-6f);
-+        const float w_l = pdf_light_w * pdf_light_w;
-+        const float w_b = pdf_bsdf_w * pdf_bsdf_w;
-+        mis_spec_weight = w_l / max(w_l + w_b, 1e-12f);
++        float mis_spec_weight = 1.0f;
++        if (is_area_light && (debug_flags & 4u) == 0u) {
++          const float pdf_bsdf_w = distribution * ndoth / max(4.0f * vdoth, 1e-6f);
++          const float w_l = pdf_light_w * pdf_light_w;
++          const float w_b = pdf_bsdf_w * pdf_bsdf_w;
++          mis_spec_weight = w_l / max(w_l + w_b, 1e-12f);
++        }
++        direct_specular = irradiance * ndotl_spec * specular * mis_spec_weight * spec_fac;
 +      }
 +
-+      const float3 direct_diffuse = irradiance * ndotl * p_diffuse_color * inv_pi *
-+                                    (1.0f - fresnel) * diff_fac;
-+      const float3 direct_specular = irradiance * ndotl * specular * mis_spec_weight * spec_fac;
 +      const float3 diffuse_contribution = clamp_radiance_luminance_preserving(
 +          direct_diffuse, srt.pathtracing_data.clamp_direct);
 +      const float3 specular_contribution = clamp_radiance_luminance_preserving(
 +          direct_specular, srt.pathtracing_data.clamp_direct);
 +      if (valid_radiance(diffuse_contribution) && valid_radiance(specular_contribution)) {
++        const bool is_sharp_local = (light_type != 4u) && (light.color_radius.a <= 0.0015f);
 +        if (light_type == 1u) {
 +          direct_radiance += diffuse_contribution + specular_contribution;
 +          if (cast_shadow) {
@@ -2841,6 +2902,9 @@ index 00000000..4f0a3eab
 +              tan_sun_radius = light.spot_flags.z;
 +            }
 +          }
++        }
++        else if (is_sharp_local) {
++          direct_radiance += diffuse_contribution + specular_contribution;
 +        }
 +        else {
 +          local_direct_diff += diffuse_contribution;
@@ -2880,7 +2944,7 @@ index 00000000..4f0a3eab
 +    }
 +
 +    /* BSDF-sampled direct specular with Power-Heuristic MIS for area lights -> REBLUR. */
-+    if ((debug_flags & 4u) == 0u) {
++    if ((debug_flags & 4u) == 0u && spec_weight_sum > 1e-6f) {
 +      for (uint light_id = 0u; light_id < srt.pathtracing_data.light_count; light_id++) {
 +        const LightRecord light = srt.light_buf[light_id];
 +        const float spec_fac = light.influence_shadow.y;
@@ -2892,13 +2956,13 @@ index 00000000..4f0a3eab
 +          continue;
 +        }
 +        const float3 half_vector = sample_ggx_half_vector(
-+            rng.next(), rng.next(), p_normal, p_alpha2);
++            rng.next(), rng.next(), p_spec_N, p_spec_alpha2);
 +        const float3 wi_bsdf = reflect(primary_ray_direction, half_vector);
-+        const float ndotl = dot(p_normal, wi_bsdf);
++        const float ndotl = dot(p_spec_N, wi_bsdf);
 +        if (ndotl <= 0.0f) {
 +          continue;
 +        }
-+        const float ndoth = saturate(dot(p_normal, half_vector));
++        const float ndoth = saturate(dot(p_spec_N, half_vector));
 +        const float vdoth = saturate(dot(p_wo, half_vector));
 +        if (ndoth <= 1e-4f || vdoth <= 0.0f) {
 +          continue;
@@ -2936,7 +3000,7 @@ index 00000000..4f0a3eab
 +            continue;
 +          }
 +        }
-+        const float pdf_bsdf_w = ggx_distribution(ndoth, p_alpha2) * ndoth /
++        const float pdf_bsdf_w = ggx_distribution(ndoth, p_spec_alpha2) * ndoth /
 +                                 max(4.0f * vdoth, 1e-6f);
 +        const float pdf_light_w = (light_distance * light_distance) /
 +                                  max(area * cos_light, 1e-6f);
@@ -2946,10 +3010,10 @@ index 00000000..4f0a3eab
 +
 +        const float3 radiance_light = light.color_radius.rgb * light.direction_power.w *
 +                                      custom_att / (area * 3.14159265358979323846f);
-+        const float3 fresnel = fresnel_schlick(p_f0, vdoth);
-+        const float geometry = smith_g1(p_ndotv, p_alpha2) * smith_g1(ndotl, p_alpha2);
-+        const float3 specular_weight = geometry * fresnel * vdoth /
-+                                       max(p_ndotv * ndoth, 1e-4f);
++        const float geometry = smith_g1(p_spec_ndotv, p_spec_alpha2) *
++                               smith_g1(ndotl, p_spec_alpha2);
++        const float3 specular_weight = geometry * p_spec_color * vdoth /
++                                       max(p_spec_ndotv * ndoth, 1e-4f);
 +        const float3 contribution = clamp_radiance_luminance_preserving(
 +            specular_weight * radiance_light * mis_bsdf_weight * spec_fac,
 +            srt.pathtracing_data.clamp_direct);
@@ -2960,29 +3024,67 @@ index 00000000..4f0a3eab
 +    }
 +
 +    /* --------------------------------------------------------
-+     * 3. Indirect diffuse & specular lobes starting from bounce = 1
-+     *    (with energy-conserving (1 - F_env) diffuse & height-correlated G2).
++     * 3. Indirect diffuse & specular/transmission lobes starting from bounce = 1.
 +     * -------------------------------------------------------- */
 +    for (uint lobe = 0u; lobe < 2u; lobe++) {
 +      const bool primary_specular = (lobe == 1u);
 +      float3 wi0;
-+      float3 brdf_weight0;
++      float3 brdf_weight0 = float3(0.0f);
++      float3 ray_origin = primary_hit_position + p_offset_normal * p_ray_epsilon;
++
 +      if (primary_specular) {
-+        const float3 half_vector = sample_ggx_vndf_half_vector(
-+            rng.next(), rng.next(), p_wo, p_normal, p_alpha, p_alpha2);
-+        wi0 = reflect(primary_ray_direction, half_vector);
-+        const float ndotl = dot(p_normal, wi0);
-+        if (ndotl <= 0.0f) {
++        const float total_st = spec_weight_sum + transmit_weight_sum;
++        if (total_st <= 1e-6f) {
 +          continue;
 +        }
-+        const float vdoth = saturate(dot(p_wo, half_vector));
-+        brdf_weight0 = fresnel_schlick(p_f0, vdoth) *
-+                       smith_g2_over_g1(p_ndotv, ndotl, p_alpha2);
++        const float prob_refl = spec_weight_sum / total_st;
++        if (rng.next() < prob_refl) {
++          const float3 half_vector = sample_ggx_vndf_half_vector(
++              rng.next(), rng.next(), p_wo, p_spec_N, p_spec_alpha, p_spec_alpha2);
++          wi0 = reflect(primary_ray_direction, half_vector);
++          const float ndotl = dot(p_spec_N, wi0);
++          if (ndotl <= 0.0f) {
++            continue;
++          }
++          brdf_weight0 = p_spec_color * smith_g2_over_g1(p_spec_ndotv, ndotl, p_spec_alpha2) /
++                         max(prob_refl, 1e-3f);
++        }
++        else {
++          const float prob_trans = max(1.0f - prob_refl, 1e-3f);
++          if (p_transmit_type == 1u) {
++            const float t_alpha = p_transmit_roughness * p_transmit_roughness;
++            const float3 half_vector = sample_ggx_vndf_half_vector(
++                rng.next(), rng.next(), p_wo, p_transmit_N, t_alpha, t_alpha * t_alpha);
++            wi0 = refract(primary_ray_direction, half_vector, 1.0f / p_transmit_ior);
++            if (dot(wi0, wi0) < 1e-4f) {
++              wi0 = reflect(primary_ray_direction, half_vector);
++            }
++            else {
++              ray_origin = primary_hit_position - p_offset_normal * p_ray_epsilon;
++            }
++            brdf_weight0 = p_transmit_color / prob_trans;
++          }
++          else if (p_transmit_type == 2u) {
++            const float t_alpha = p_transmit_roughness * p_transmit_roughness;
++            const float3 half_vector = sample_ggx_vndf_half_vector(
++                rng.next(), rng.next(), p_wo, p_transmit_N, t_alpha, t_alpha * t_alpha);
++            wi0 = refract(primary_ray_direction, half_vector, 1.0f);
++            ray_origin = primary_hit_position - p_offset_normal * p_ray_epsilon;
++            brdf_weight0 = p_transmit_color / prob_trans;
++          }
++          else {
++            wi0 = sample_cosine_hemisphere(rng.next(), rng.next(), -p_transmit_N);
++            ray_origin = primary_hit_position - p_offset_normal * p_ray_epsilon;
++            brdf_weight0 = p_transmit_color / prob_trans;
++          }
++        }
 +      }
 +      else {
-+        wi0 = sample_cosine_hemisphere(rng.next(), rng.next(), p_normal);
-+        const float3 f_env0 = nrd_environment_term(p_f0, p_ndotv, p_roughness);
-+        brdf_weight0 = p_diffuse_color * (float3(1.0f) - f_env0);
++        if (diff_weight_sum <= 1e-6f) {
++          continue;
++        }
++        wi0 = sample_cosine_hemisphere(rng.next(), rng.next(), p_diff_N);
++        brdf_weight0 = p_diff_color;
 +      }
 +
 +      float3 throughput = min(brdf_weight0, float3(100.0f));
@@ -2992,11 +3094,10 @@ index 00000000..4f0a3eab
 +        continue;
 +      }
 +
-+      float3 ray_origin = primary_hit_position + p_offset_normal * p_ray_epsilon;
-+      float3 ray_direction = safe_normalize(wi0, p_normal);
++      float3 ray_direction = safe_normalize(wi0, surface_N);
 +      float path_hitdist = 0.0f;
 +      float path_diffuse_motion = 0.0f;
-+      float path_curvature = p_curvature;
++      float path_curvature = 0.0f;
 +      float3 path_lsum = float3(0.0f);
 +
 +      for (uint bounce = 1u; bounce < max_bounces; bounce++) {
@@ -3372,7 +3473,6 @@ index 00000000..4f0a3eab
 +             2.0f * emission_proxy;
 +  frag_out.color = float4(radiance + direct_radiance, 0.0f);
 +
-+  const int2 frag_texel = int2(frag_co.xy);
 +  const int2 nrd_texel = int2(frag_texel.x,
 +                              int(srt.pathtracing_data.resolution.y) - 1 - frag_texel.y);
 +  imageStore(srt.out_normal_roughness_img,
@@ -3423,20 +3523,30 @@ index 00000000..4f0a3eab
 +                              float4(primary_prev_hit_position, 1.0f))
 +                                 .z;
 +    nrd_motion_z = prev_viewz - nrd_viewz;
-+    float2 prev_uv;
-+    float2 curr_uv;
-+    if (project_screen_uv_unbounded(srt.pathtracing_data.prev_world_to_view,
-+                                    srt.pathtracing_data.prev_view_to_clip,
-+                                    primary_prev_hit_position,
-+                                    prev_uv) &&
-+        project_screen_uv_unbounded(srt.pathtracing_data.curr_world_to_view,
-+                                    srt.pathtracing_data.curr_view_to_clip,
-+                                    primary_hit_position,
-+                                    curr_uv))
-+    {
++
++    const float4 vec_packed = texelFetch(srt.in_vector_tx, frag_texel, 0);
++    if (vec_packed.x != VELOCITY_INVALID && (vec_packed.x != 0.0f || vec_packed.y != 0.0f)) {
++      const float2 motion_uv = vec_packed.xy * 100.0f;
 +      const float2 resolution_f = float2(srt.pathtracing_data.resolution);
-+      nrd_motion.x = (prev_uv.x - curr_uv.x) * resolution_f.x;
-+      nrd_motion.y = -(prev_uv.y - curr_uv.y) * resolution_f.y;
++      nrd_motion.x = motion_uv.x * resolution_f.x;
++      nrd_motion.y = -motion_uv.y * resolution_f.y;
++    }
++    else {
++      float2 prev_uv;
++      float2 curr_uv;
++      if (project_screen_uv_unbounded(srt.pathtracing_data.prev_world_to_view,
++                                      srt.pathtracing_data.prev_view_to_clip,
++                                      primary_prev_hit_position,
++                                      prev_uv) &&
++          project_screen_uv_unbounded(srt.pathtracing_data.curr_world_to_view,
++                                      srt.pathtracing_data.curr_view_to_clip,
++                                      primary_hit_position,
++                                      curr_uv))
++      {
++        const float2 resolution_f = float2(srt.pathtracing_data.resolution);
++        nrd_motion.x = (prev_uv.x - curr_uv.x) * resolution_f.x;
++        nrd_motion.y = -(prev_uv.y - curr_uv.y) * resolution_f.y;
++      }
 +    }
 +  }
 +  if ((debug_flags & 8u) != 0u) {
@@ -3961,7 +4071,7 @@ index 733276c8..2a14ea56 100644
      return mem_allocator_;
 diff --git a/source/blender/gpu/vulkan/vk_nrd.cc b/source/blender/gpu/vulkan/vk_nrd.cc
 new file mode 100644
-index 00000000..1bdfcb3e
+index 00000000..144356a9
 --- /dev/null
 +++ b/source/blender/gpu/vulkan/vk_nrd.cc
 @@ -0,0 +1,369 @@
@@ -4099,9 +4209,9 @@ index 00000000..1bdfcb3e
 +   * is 0 instead of the sample's metal-only 1. */
 +  nrd::ReblurSettings settings = {};
 +  settings.maxAccumulatedFrameNum = 31;
-+  settings.maxFastAccumulatedFrameNum = 7;
++  settings.maxFastAccumulatedFrameNum = 3;       /* 原 7 -> 3，大幅缩短移动发光体残影 */
 +  settings.maxStabilizedFrameNum = 31;
-+  settings.fastHistoryClampingSigmaScale = 1.5f;
++  settings.fastHistoryClampingSigmaScale = 0.8f; /* 原 1.5f -> 0.8f，快速甩掉静态面上的旧光照 */
 +  settings.minMaterialForDiffuse = 0.0f;
 +  settings.minMaterialForSpecular = 0.0f;
 +  settings.enableAntiFirefly = true;

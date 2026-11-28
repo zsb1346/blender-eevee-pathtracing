@@ -2,7 +2,7 @@
 
 在 Blender 5.3 EEVEE 中接入 Vulkan 硬件 ray query 的实时路径追踪原型，并使用 NRD 4.17.1 做降噪。
 
-> **状态：研究原型，未达到生产可用。** 2026-11-27 build18 后当前 exe 稳定健康。已修复：视口红弧、间接光近 0 回归、SIGMA 硬阴影、视口 PT 被 `taa_samples` 截断、Debug View 时间累积污染、间接光溢出/青色条纹/点光 firefly/emission 解调、转视角历史被逐帧清空、运动矢量与历史键碰撞（红弧/满地红斑/viewport3 全黄的根因）、动态实例历史键、间接光越弹越亮，以及 MV 屏幕边界历史误用。当前高速移动/旋转视角下 Viewport 3（MV 误差）全程纯黑，累积帧数轨迹与 NRD-Sample 一致。仍需多场景/多 GPU/不同分辨率复验。材质节点树、transmission、BLAS 索引映射、`eevee_pipeline.cc` 跳过 DeferredLayer 着色等仍未完成。
+> **状态：研究原型，未达到生产可用。** 2026-11-28 build25（当前补丁）为首交点接入 EEVEE 全材质节点系统后的稳定版本。已修复：视口红弧、间接光近 0 回归、SIGMA 硬阴影、视口 PT 被 `taa_samples` 截断、Debug View 时间累积污染、间接光溢出/青色条纹/点光 firefly/emission 解调、转视角历史被逐帧清空、运动矢量与历史键碰撞（红弧/满地红斑/viewport3 全黄的根因）、动态实例历史键、间接光越弹越亮、MV 屏幕边界历史误用，以及 build24c 切 PATH_TRACING 时 GBuffer 纹理提前 release 导致的崩溃。当前高速移动/旋转视角下 Viewport 3（MV 误差）全程纯黑，累积帧数轨迹与 NRD-Sample 一致。仍需多场景/多 GPU/不同分辨率复验。次级反弹材质、BLAS 索引映射等仍未完成；首交点已接入全材质节点系统（见下）。
 
 这个仓库只包含**源码补丁、文档、测试脚本和测试场景**，不包含完整 Blender 源码或构建产物。完整 Blender 工作区约 16 GB，不适合直接放进 Git 仓库。
 
@@ -40,18 +40,19 @@
 | SIGMA 太阳软阴影 | 已接入；0.5°/10° A/B 可见差异 |
 | Raytracing UI | 可用 |
 | 编辑模式 | 已修复 |
-| 纹理/节点树材质 | 未完成 |
-| transmission / emission / volume / hair | 未完成 |
-| DeferredLayer 着色跳过（性能） | 未做；当前 `deferred.render()` 着色仍跑，待具体方案 |
+| 首交点全材质节点系统 | build24/25 已接入：首交点走 EEVEE G-Buffer + 全材质节点求值（Principled/Mix/Diffuse/Glossy/Emission/Glass/Thin Glass/Translucent/SSS/Clearcoat，贴图/UDIM/ColorRamp/Noise/Voronoi/Bump/几何节点属性），省掉主相机 Ray Query；运动矢量优先用原生 `vector_tx`（骨骼/布料动态） |
+| 次级反弹材质 | 简化 MaterialRecord（Stage 1 定位，仅首交点接入全节点系统） |
+| transmission / emission / volume / hair | 首交点已覆盖 transmission/emission；volume / hair 未完成 |
+| DeferredLayer 着色分支 | build24：PT 模式下 prepass_add/material_add 折射并入 opaque_layer_，`DeferredLayer::render` 跑完 GBuffer 写入后提前返回（跳过阴影/SSRT/光照/SSS/Combine）；GBuffer release 推迟到 PT submit 之后 |
 
 已知问题：
 
-- 材质节点树/纹理尚未接入，当前主要读取 Principled 常量；玻璃球发白。
+- 首交点已接入全材质节点系统，但次级反弹（bounce≥1）仍走简化 MaterialRecord，未读到完整节点树。
 - 多材质或存在隐藏面时，BLAS 与 primitive 表的索引映射仍可能不一致。
 - 金属 NRD 反射仍偏糊；BLAS 对原地 deform 的更新仍是 stale。
 - NRD/NRI/libxess 目前是 Windows 原型集成，尚未做成正式的可选模块。
 - Headless still 每次从 sample 0 开始，跨帧 TAA history 不连续；跨帧验证需要 GUI viewport 或多 redraw harness。
-- 性能：`eevee_pipeline.cc` 尚未跳过 DeferredLayer 着色（只留 depth prepass），该优化待具体方案。
+- build25 只做了编译与启动验证（切 PATH_TRACING 不再崩溃），首交点贴图/玻璃/清漆的画质与实际帧率仍需多场景复验。
 
 ## 快速开始
 
